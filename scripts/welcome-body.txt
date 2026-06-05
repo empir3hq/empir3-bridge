@@ -1,0 +1,2354 @@
+  const api = apiBase || '';
+  const signedIn = hasBridgeAuth();
+
+  // Map each tool to the global safety category it requires (mirrors
+  // requiredBridgePermission() in this file). Drives the per-row "NEEDS X"
+  // warning chip when a tool is enabled but its required global category
+  // is off — saves users from chasing silent denials.
+  const toolsEnriched = TOOL_META.map(t => ({
+    n: t.name,
+    g: t.group,
+    d: t.defaultEnabled,
+    r: TOOL_PERMISSION_REQUIREMENTS[t.name] || null,
+    b: t.blurb,
+  }));
+  const toolsJson = JSON.stringify(toolsEnriched);
+  const toolCount = TOOL_META.length;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>empir3 Bridge — Console</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');
+  * { box-sizing: border-box; }
+  :root {
+    --ink:#18181b;--ink-2:#27272a;--ink-3:#3f3f46;
+    --paper:#ffffff;--bg:#f4f4f5;--surface:#fafafa;--surface-2:#e4e4e7;
+    --rail:#18181b;--rail-2:#27272a;
+    --rail-line:rgba(255,255,255,0.08);
+    --rail-text:#d4d4d8;--rail-text-dim:#71717a;--rail-text-bright:#fafafa;
+    --line:rgba(0,0,0,0.10);--line-strong:rgba(0,0,0,0.18);--rule:rgba(0,0,0,0.06);
+    --muted:#52525b;--soft:#71717a;--faint:#a1a1aa;
+    --accent:#6b4ef0;--accent-soft:rgba(107,78,240,0.10);
+    --good:#059669;--good-soft:rgba(5,150,105,0.10);
+    --warn:#d97706;--warn-soft:rgba(217,119,6,0.10);
+    --bad:#dc2626;--bad-soft:rgba(220,38,38,0.10);
+  }
+  body[data-theme="dark"] {
+    --ink:#fafafa;--ink-2:#e4e4e7;--ink-3:#d4d4d8;
+    --paper:#18181b;--bg:#09090b;--surface:#1f1f23;--surface-2:#27272a;
+    --rail:#050507;--rail-2:#131316;--rail-line:rgba(255,255,255,0.06);
+    --rail-text:#a1a1aa;--rail-text-dim:#52525b;--rail-text-bright:#fafafa;
+    --line:rgba(255,255,255,0.08);--line-strong:rgba(255,255,255,0.16);--rule:rgba(255,255,255,0.05);
+    --muted:#a1a1aa;--soft:#71717a;--faint:#52525b;
+    --accent:#8c6bff;--accent-soft:rgba(140,107,255,0.14);
+    --good:#10b981;--good-soft:rgba(16,185,129,0.14);
+    --warn:#f59e0b;--warn-soft:rgba(245,158,11,0.14);
+    --bad:#ef4444;--bad-soft:rgba(239,68,68,0.14);
+  }
+  body[data-theme="dark"] pre.snippet { background:#050507; color:#fafafa; }
+  body[data-theme="dark"] .signin { background:var(--accent); border-color:var(--accent); color:#fff; }
+  body[data-theme="dark"] .signin:hover { background:#7a55ff; border-color:#7a55ff; }
+  body[data-theme="dark"] .signin .brand-inline .three,
+  body[data-theme="dark"] .btn.primary .brand-inline .three { color:#fff; }
+  body[data-theme="dark"] .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  body[data-theme="dark"] .btn.primary:hover { background:#7a55ff; border-color:#7a55ff; }
+  body[data-theme="dark"] .tag.solid-ink { background:var(--accent); color:#fff; border-color:var(--accent); }
+  body[data-theme="dark"] .perm-toolbar .filter-group button.on { background:var(--accent); color:#fff; }
+  body[data-theme="dark"] .acct .av { background:linear-gradient(135deg,#8c6bff,#b8a3ff); }
+  body[data-theme="dark"] .rail-foot .led { box-shadow:0 0 6px rgba(16,185,129,0.5); }
+  body[data-theme="dark"] .tele-cell .led { box-shadow:0 0 5px rgba(16,185,129,0.45); }
+
+  html, body { margin:0; height:100vh; overflow:hidden; }
+  body {
+    background:var(--bg); color:var(--ink);
+    font-family:'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size:14.5px; line-height:1.5;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+    font-feature-settings:'cv11','ss01','ss03';
+  }
+  code, pre.snippet {
+    font-family:'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-variant-numeric:tabular-nums;
+  }
+  .mono, .num { font-feature-settings:'cv11','ss01'; font-variant-numeric:tabular-nums; letter-spacing:-0.005em; }
+
+  .app { display:grid; grid-template-columns:224px 1fr; height:100vh; }
+  aside.rail {
+    background:var(--rail); color:var(--rail-text);
+    display:grid; grid-template-rows:auto 1fr auto;
+    border-right:1px solid var(--rail-line); overflow:hidden;
+  }
+  .rail-head { padding:18px 20px 16px; border-bottom:1px solid var(--rail-line); }
+  .rail-brand { display:flex; align-items:baseline; gap:0; font-weight:900; font-size:19px; letter-spacing:-0.01em; color:var(--rail-text-bright); line-height:1; }
+  .rail-brand .three { color:var(--accent); }
+  .rail-brand .sub { margin-left:8px; font-weight:700; font-size:14px; color:var(--rail-text-dim); }
+  .rail-tag { margin-top:8px; font-variant-numeric:tabular-nums; font-size:10px; color:var(--rail-text-dim); letter-spacing:0.04em; }
+  .rail-tag .live { display:inline-block; width:6px; height:6px; background:var(--good); border-radius:1px; margin-right:6px; box-shadow:0 0 8px rgba(15,139,90,0.7); }
+
+  .rail-nav { padding:14px 10px; overflow-y:auto; }
+  .rail-section-label { padding:14px 12px 6px; font-size:11px; font-weight:700; letter-spacing:0.14em; text-transform:uppercase; color:var(--rail-text-dim); }
+  .rail-nav a { display:flex; align-items:center; gap:11px; padding:9px 12px; margin:1px 0; color:var(--rail-text); text-decoration:none; font-weight:500; font-size:14px; border-radius:5px; cursor:pointer; position:relative; }
+  .rail-nav a:hover { background:var(--rail-2); color:var(--rail-text-bright); }
+  .rail-nav a.active { background:var(--rail-2); color:var(--rail-text-bright); font-weight:700; }
+  .rail-nav a.active::before { content:''; position:absolute; left:0; top:6px; bottom:6px; width:3px; background:var(--accent); border-radius:0 2px 2px 0; }
+  .rail-nav a .ico { width:16px; height:16px; color:var(--rail-text-dim); flex-shrink:0; }
+  .rail-nav a.active .ico { color:var(--accent); }
+  .rail-nav a .count { margin-left:auto; font-variant-numeric:tabular-nums; font-size:10.5px; color:var(--rail-text-dim); background:rgba(255,255,255,0.06); padding:1px 6px; border-radius:3px; }
+  .rail-nav a.danger { color:#e88a85; }
+  .rail-nav a.danger .ico { color:#c66662; }
+
+  .rail-foot { padding:12px 16px 14px; border-top:1px solid var(--rail-line); display:grid; gap:8px; }
+  .rail-foot .row { display:flex; align-items:center; gap:8px; font-variant-numeric:tabular-nums; font-size:10.5px; color:var(--rail-text-dim); }
+  .rail-foot .row .k { color:var(--rail-text); }
+  .rail-foot .led { width:7px; height:7px; border-radius:1px; background:var(--good); box-shadow:0 0 6px rgba(15,139,90,0.6); }
+  .rail-foot .led.warn { background:var(--warn); box-shadow:0 0 6px rgba(182,107,0,0.6); }
+
+  main.console { display:grid; grid-template-rows:auto auto 1fr; overflow:hidden; background:var(--bg); }
+  .topbar { display:flex; align-items:center; gap:14px; padding:12px 22px; background:var(--paper); border-bottom:1px solid var(--line); height:52px; }
+  .crumbs { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--soft); }
+  .crumbs .here { color:var(--ink); font-weight:700; }
+  .crumbs .sep { color:var(--faint); }
+  .topbar .spacer { flex:1; }
+  .topbar .search { width:280px; position:relative; }
+  .topbar .search input { width:100%; padding:7px 10px 7px 30px; border:1px solid var(--line); background:var(--surface); color:var(--ink); font:inherit; font-size:12.5px; border-radius:4px; }
+  .topbar .search svg { position:absolute; left:9px; top:50%; transform:translateY(-50%); width:13px; height:13px; color:var(--soft); }
+  .topbar kbd { position:absolute; right:8px; top:50%; transform:translateY(-50%); font-variant-numeric:tabular-nums; font-size:10px; color:var(--soft); border:1px solid var(--line); padding:1px 5px; border-radius:3px; background:var(--paper); }
+  .theme-toggle { appearance:none; width:32px; height:32px; display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--line); background:var(--surface); color:var(--muted); border-radius:5px; cursor:pointer; transition:color 100ms ease, border-color 100ms ease, background 100ms ease; }
+  .theme-toggle:hover { color:var(--ink); border-color:var(--line-strong); }
+  .theme-toggle svg { width:15px; height:15px; }
+  body[data-theme="light"] .theme-toggle .moon { display:none; }
+  body[data-theme="dark"]  .theme-toggle .sun  { display:none; }
+  .signin { display:inline-flex; align-items:center; gap:9px; padding:8px 14px; border:1px solid var(--ink); background:var(--ink); color:var(--bg); font:inherit; font-weight:700; font-size:12.5px; cursor:pointer; border-radius:5px; transition:background 100ms ease; }
+  .signin:hover { background:var(--ink-2); }
+  .signin svg { width:12px; height:12px; }
+  .signin .brand-inline { color:inherit; }
+  .brand-inline { display:inline-flex; align-items:baseline; font-weight:700; color:inherit; }
+  .brand-inline .three { color:var(--accent); }
+  .signin .brand-inline .three { color:#b8a3ff; }
+  .acct { display:inline-flex; align-items:center; gap:9px; padding:5px 10px 5px 6px; border:1px solid var(--line-strong); background:var(--surface); border-radius:5px; font:inherit; font-weight:600; font-size:12.5px; cursor:pointer; color:var(--ink); }
+  .acct:hover { border-color:var(--accent); }
+  .acct .av { width:22px; height:22px; background:linear-gradient(135deg, var(--accent), #8c6bff); color:#fff; font-weight:800; font-size:10.5px; display:inline-flex; align-items:center; justify-content:center; border-radius:4px; }
+  .acct .em { color:var(--muted); font-size:12px; }
+  .acct .car { color:var(--soft); font-size:9px; }
+
+  .tele-strip { display:flex; gap:0; background:var(--surface); border-bottom:1px solid var(--line); padding:0; overflow-x:auto; }
+  .tele-cell { flex:1; min-width:0; padding:12px 22px; border-right:1px solid var(--rule); display:grid; gap:3px; }
+  .tele-cell:last-child { border-right:none; }
+  .tele-cell .lbl { font-size:11px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; color:var(--soft); display:flex; align-items:center; gap:7px; }
+  .tele-cell .led { width:7px; height:7px; border-radius:1px; background:var(--good); box-shadow:0 0 5px rgba(15,139,90,0.5); }
+  .tele-cell .led.warn { background:var(--warn); box-shadow:0 0 5px rgba(182,107,0,0.5); }
+  .tele-cell .led.bad { background:var(--bad); box-shadow:0 0 5px rgba(178,36,31,0.5); }
+  .tele-cell .led.idle { background:var(--soft); box-shadow:none; }
+  .tele-cell .val { font-variant-numeric:tabular-nums; font-size:15px; font-weight:600; color:var(--ink); line-height:1.15; letter-spacing:-0.01em; }
+  .tele-cell .sub { font-variant-numeric:tabular-nums; font-size:11.5px; color:var(--muted); line-height:1.4; }
+  .safety-shortcuts { display:inline-flex; align-items:center; gap:4px; }
+  .safety-shortcut { appearance:none; border:1px solid transparent; background:transparent; color:var(--muted); font:inherit; font-weight:800; line-height:1; padding:2px 3px; border-radius:3px; cursor:pointer; min-width:18px; }
+  .safety-shortcut:hover { border-color:var(--accent); color:var(--ink); }
+  .safety-shortcut.on { color:var(--good); }
+  .safety-shortcut.off { color:var(--muted); opacity:0.55; }
+  .safety-divider { color:var(--muted); font-weight:600; }
+
+  .pane-scroll { overflow-y:auto; padding:24px 22px 36px; }
+  .pane { max-width:1100px; }
+  .pane[data-pane] { display:none; }
+  .pane.active { display:block; }
+
+  h1.pane-title { margin:0 0 4px; font-size:22px; font-weight:800; letter-spacing:-0.005em; }
+  p.pane-lede { margin:0 0 22px; color:var(--muted); font-size:14.5px; line-height:1.6; max-width:68ch; }
+
+  .block { background:var(--paper); border:1px solid var(--line); border-radius:6px; margin-bottom:18px; }
+  .block-head { padding:12px 16px; border-bottom:1px solid var(--rule); display:flex; align-items:center; gap:12px; background:var(--surface); border-radius:6px 6px 0 0; }
+  .block-head .ix { font-variant-numeric:tabular-nums; font-size:11.5px; font-weight:600; color:var(--soft); letter-spacing:0; }
+  .block-head .title { font-size:13.5px; font-weight:700; letter-spacing:0.04em; color:var(--ink); }
+  .block-head .spacer { flex:1; }
+  .block-head .sub { font-size:12.5px; color:var(--muted); }
+  .block-body { padding:14px 16px; }
+
+  .tag { display:inline-flex; align-items:center; gap:5px; padding:3px 7px; border-radius:3px; font-variant-numeric:tabular-nums; font-size:11px; font-weight:600; letter-spacing:0; background:var(--surface-2); color:var(--muted); border:1px solid var(--line); white-space:nowrap; }
+  .tag.good { background:var(--good-soft); color:var(--good); border-color:rgba(15,139,90,0.22); }
+  .tag.warn { background:var(--warn-soft); color:var(--warn); border-color:rgba(182,107,0,0.22); }
+  .tag.bad  { background:var(--bad-soft);  color:var(--bad);  border-color:rgba(178,36,31,0.22); }
+  .tag.accent { background:var(--accent-soft); color:var(--accent); border-color:rgba(107,78,240,0.22); }
+  .tag.solid-ink { background:var(--ink); color:var(--bg); border-color:var(--ink); }
+
+  .btn { appearance:none; display:inline-flex; align-items:center; justify-content:center; gap:7px; padding:7px 12px; border:1px solid var(--line-strong); background:var(--paper); color:var(--ink); font:inherit; font-weight:600; font-size:12.5px; cursor:pointer; border-radius:4px; min-height:32px; transition:border-color 100ms ease, background 100ms ease; }
+  .btn:hover { border-color:var(--accent); }
+  .btn.primary { background:var(--ink); color:var(--bg); border-color:var(--ink); }
+  .btn.primary:hover { background:var(--ink-2); border-color:var(--ink-2); }
+  .btn.danger { color:var(--bad); border-color:rgba(178,36,31,0.35); }
+  .btn.danger:hover { background:var(--bad-soft); border-color:var(--bad); }
+  .btn.small { padding:4px 8px; min-height:26px; font-size:11.5px; }
+  .btn.ghost { background:transparent; }
+  .btn:disabled { opacity:0.4; cursor:not-allowed; }
+  .btn svg { width:12px; height:12px; }
+
+  .sw { position:relative; display:inline-block; width:32px; height:18px; flex-shrink:0; }
+  .sw input { opacity:0; width:0; height:0; }
+  .sw .s { position:absolute; inset:0; background:rgba(0,0,0,0.22); border-radius:3px; transition:background 140ms ease; cursor:pointer; }
+  .sw .s::before { content:''; position:absolute; width:14px; height:14px; left:2px; top:2px; background:#fff; border-radius:2px; box-shadow:0 1px 3px rgba(0,0,0,0.3); transition:transform 140ms cubic-bezier(.4,1.4,.6,1); }
+  .sw input:checked + .s { background:var(--good); }
+  .sw input:checked + .s::before { transform:translateX(14px); }
+
+  .safety-bar { display:grid; grid-template-columns:repeat(3, 1fr); gap:1px; background:var(--line); margin:0; }
+  .safety-cell { background:var(--paper); padding:14px 16px; display:grid; grid-template-columns:auto 1fr auto; gap:12px; align-items:center; }
+  .safety-cell .ico { width:28px; height:28px; border-radius:4px; background:var(--bad-soft); color:var(--bad); display:inline-flex; align-items:center; justify-content:center; }
+  .safety-cell.on .ico { background:var(--good-soft); color:var(--good); }
+  .safety-cell .ico svg { width:14px; height:14px; }
+  .safety-cell .meta .name { font-weight:700; font-size:13px; }
+  .safety-cell .meta .sub { font-size:11px; color:var(--muted); margin-top:1px; }
+
+  .perm-toolbar { display:flex; align-items:center; gap:10px; padding:10px 16px; border-bottom:1px solid var(--rule); background:var(--surface); flex-wrap:wrap; }
+  .perm-toolbar .filter-group { display:inline-flex; background:var(--paper); border:1px solid var(--line); border-radius:4px; overflow:hidden; }
+  .perm-toolbar .filter-group button { appearance:none; background:transparent; border:none; border-right:1px solid var(--line); padding:6px 11px; font:inherit; font-size:12.5px; font-weight:600; letter-spacing:0; color:var(--muted); cursor:pointer; }
+  .perm-toolbar .filter-group button:last-child { border-right:none; }
+  .perm-toolbar .filter-group button.on { background:var(--ink); color:var(--bg); }
+  .perm-toolbar .filter-group button:hover:not(.on) { background:var(--surface-2); color:var(--ink); }
+  .perm-toolbar .count-readout { margin-left:auto; font-variant-numeric:tabular-nums; font-size:12.5px; color:var(--soft); }
+  .perm-toolbar .count-readout .num { color:var(--ink); font-weight:700; }
+  .perm-toolbar .scope-note, .perm-bulkbar .scope-note { display:inline-flex; align-items:center; gap:8px; padding:6px 11px; border:1px solid var(--line); background:var(--accent-soft); color:var(--ink); border-radius:4px; font-size:12.5px; line-height:1.4; }
+  .perm-toolbar .scope-note svg, .perm-bulkbar .scope-note svg { color:var(--accent); }
+
+  .perm-bulkbar { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--rule); background:var(--paper); flex-wrap:wrap; }
+  .perm-bulkbar .bulk-actions { display:inline-flex; gap:6px; }
+
+  .perm-table .dep-warn { display:inline-flex; align-items:center; gap:5px; padding:2px 7px; border-radius:3px; font-size:11px; font-weight:600; background:var(--warn-soft); color:var(--warn); border:1px solid color-mix(in srgb, var(--warn) 28%, var(--line)); margin-left:8px; cursor:help; }
+  .perm-table .dep-warn svg { width:11px; height:11px; }
+
+  .perm-table { width:100%; border-collapse:collapse; font-size:13px; }
+  .perm-table thead th { text-align:left; padding:10px 16px; font-size:11px; font-weight:700; letter-spacing:0.10em; text-transform:uppercase; color:var(--soft); background:var(--surface); border-bottom:1px solid var(--line); position:sticky; top:0; }
+  .perm-table tbody tr { border-bottom:1px solid var(--rule); transition:background 80ms ease; }
+  .perm-table tbody tr:hover { background:var(--surface); }
+  .perm-table tbody tr.group-header { background:var(--surface-2); cursor:pointer; }
+  .perm-table tbody tr.group-header:hover { background:var(--surface-2); }
+  .perm-table tbody tr.group-header td { padding:9px 16px; font-size:11.5px; font-weight:700; letter-spacing:0.10em; text-transform:uppercase; color:var(--ink-3); border-bottom:1px solid var(--line); }
+  .perm-table tbody tr.group-header td .count { font-variant-numeric:tabular-nums; font-size:11.5px; font-weight:500; letter-spacing:0; text-transform:none; color:var(--soft); margin-left:10px; }
+  .perm-table tbody tr.group-header .bulk { float:right; display:inline-flex; gap:4px; text-transform:none; letter-spacing:0; }
+  .perm-table tbody tr.group-header .bulk button { appearance:none; border:1px solid var(--line-strong); background:var(--paper); color:var(--muted); font:inherit; font-variant-numeric:tabular-nums; font-size:11.5px; font-weight:500; padding:3px 9px; border-radius:3px; cursor:pointer; }
+  .perm-table tbody tr.group-header .bulk button:hover { color:var(--ink); border-color:var(--accent); }
+  .perm-table td { padding:9px 16px; vertical-align:top; }
+  .perm-table td.col-tg { width:44px; padding-top:11px; }
+  .perm-table td.col-nm { font-variant-numeric:tabular-nums; font-size:13px; font-weight:500; color:var(--ink); white-space:nowrap; width:230px; }
+  .perm-table td.col-tag { width:110px; padding-top:11px; }
+  .perm-table td.col-blurb { color:var(--muted); font-size:13.5px; line-height:1.5; }
+  .perm-table tr.disabled td.col-nm { color:var(--faint); }
+  .perm-table tr.eval td.col-nm { color:var(--bad); }
+
+  .kv { display:grid; grid-template-columns:130px 1fr; gap:4px 16px; font-size:13px; }
+  .kv .k { color:var(--soft); font-weight:600; font-size:12px; letter-spacing:0.04em; text-transform:uppercase; align-self:center; }
+  .kv .v { color:var(--ink); font-weight:500; }
+  .kv .v.mono { font-variant-numeric:tabular-nums; letter-spacing:-0.005em; font-weight:500; font-size:13.5px; word-break:break-all; }
+  .kv .v + .k { margin-top:8px; }
+  .kv .k + .v { padding:4px 0; }
+
+  .log-table { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px; }
+  .log-table td { padding:5px 10px; border-bottom:1px solid var(--rule); vertical-align:middle; white-space:nowrap; }
+  .log-table tr:last-child td { border-bottom:none; }
+  .log-table td.ts { color:var(--soft); font-size:12px; width:70px; }
+  .log-table td.nm { color:var(--ink); font-weight:500; }
+  .log-table td.st { color:var(--good); font-weight:600; width:40px; }
+  .log-table td.st.err { color:var(--bad); }
+  .log-table td.ms { color:var(--muted); text-align:right; width:64px; }
+  .log-table td.dt { color:var(--soft); font-size:12px; overflow:hidden; text-overflow:ellipsis; max-width:280px; }
+
+  pre.snippet { margin:0; padding:12px 14px; background:var(--ink); color:var(--bg); border-radius:5px; font-size:12px; line-height:1.55; overflow:auto; white-space:pre; max-height:240px; }
+
+  .backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.30); z-index:50; display:none; }
+  .backdrop.open { display:block; }
+  .drawer { position:fixed; top:0; right:0; bottom:0; width:400px; max-width:92vw; background:var(--paper); border-left:1px solid var(--line-strong); z-index:60; display:none; grid-template-rows:auto auto 1fr; box-shadow:-16px 0 40px rgba(0,0,0,0.18); }
+  .drawer.open { display:grid; }
+  .drawer-head { display:flex; align-items:center; gap:10px; padding:14px 18px; border-bottom:1px solid var(--line); background:var(--surface); }
+  .drawer-head .title { font-size:15px; font-weight:700; letter-spacing:-0.005em; color:var(--ink); }
+  .drawer > .sub { margin:0; padding:12px 18px 14px; background:var(--surface); border-bottom:1px solid var(--line); color:var(--muted); font-size:13px; line-height:1.5; }
+  .drawer-head .spacer { flex:1; }
+  .drawer-head .x { appearance:none; border:none; background:none; width:28px; height:28px; color:var(--soft); cursor:pointer; border-radius:4px; }
+  .drawer-head .x:hover { background:var(--surface-2); color:var(--ink); }
+  .drawer-body { padding:18px; display:grid; gap:14px; overflow-y:auto; align-content:start; }
+  .drawer-body label { display:grid; gap:6px; font-size:12.5px; color:var(--ink); font-weight:600; }
+  .drawer-body input, .drawer-body select { width:100%; padding:9px 11px; border:1px solid var(--line-strong); background:var(--paper); color:var(--ink); font:inherit; font-size:13.5px; font-weight:400; border-radius:4px; height:36px; line-height:1.2; }
+  .drawer-body input::placeholder { color:var(--faint); }
+  .drawer-body input:focus, .drawer-body select:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .drawer-body .btn.primary, .drawer-body .btn { min-height:36px; padding:8px 14px; }
+  .drawer-body .divider { display:flex; align-items:center; gap:10px; color:var(--soft); font-size:11.5px; font-weight:500; margin:2px 0; }
+  .drawer-body .divider::before, .drawer-body .divider::after { content:''; flex:1; height:1px; background:var(--rule); }
+  .drawer-body .fields { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .drawer-body .hint { margin:-4px 0 0; font-size:11.5px; color:var(--soft); line-height:1.4; }
+  .drawer-body .status { margin:0; font-size:12px; color:var(--muted); min-height:14px; }
+  .drawer-body .status.ok { color:var(--good); }
+  .drawer-body .status.err { color:var(--bad); }
+
+  body[data-view="signedout"] .when-signedin { display:none !important; }
+  body[data-view="signedin"]  .when-signedout { display:none !important; }
+
+  .ov-grid { display:grid; grid-template-columns:repeat(12, 1fr); gap:14px; }
+  .ov-tile { grid-column:span 6; background:var(--paper); border:1px solid var(--line); border-radius:6px; padding:16px; }
+  .ov-tile.s4 { grid-column:span 4; }
+  .ov-tile.s8 { grid-column:span 8; }
+  .ov-tile.s12 { grid-column:span 12; }
+  .ov-tile h3 { margin:0 0 4px; font-size:12px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:var(--soft); }
+  .ov-tile .big { font-variant-numeric:tabular-nums; font-size:24px; font-weight:500; color:var(--ink); line-height:1.1; margin:6px 0 4px; letter-spacing:-0.01em; }
+  .ov-tile .big.good { color:var(--good); }
+  .ov-tile .big.warn { color:var(--warn); }
+  .ov-tile .big.bad { color:var(--bad); }
+  .ov-tile p { margin:6px 0 0; color:var(--muted); font-size:13.5px; line-height:1.55; }
+  .ov-tile .actions { margin-top:12px; display:flex; gap:6px; flex-wrap:wrap; }
+
+  .stub { border:1px dashed var(--line-strong); background:var(--surface); border-radius:6px; padding:32px 24px; color:var(--muted); font-size:13px; text-align:center; }
+
+  /* Generic status text under blocks/buttons */
+  .status { min-height:16px; font-size:12.5px; color:var(--muted); margin:0; }
+  .status.ok { color:var(--good); }
+  .status.err { color:var(--bad); }
+  .status.info { color:var(--accent); }
+  .desktop-metrics { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:4px; overflow:hidden; margin-bottom:14px; }
+  .desktop-metric { background:var(--paper); padding:12px; min-width:0; }
+  .desktop-metric.wide { grid-column:span 2; }
+  .desktop-metric .label { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:var(--soft); margin-bottom:6px; }
+  .desktop-metric .value { font-size:20px; line-height:1.1; font-weight:800; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .desktop-metric .value.small { font-size:13px; line-height:1.35; font-weight:600; white-space:normal; word-break:break-all; }
+  .desktop-metric .value.good { color:var(--good); }
+  .desktop-metric .value.warn { color:var(--warn); }
+  .desktop-metric .value.bad { color:var(--bad); }
+  .desktop-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .desktop-output { display:none; margin:12px 0 0; padding:10px; min-height:64px; max-height:220px; overflow:auto; border:1px solid var(--line); border-radius:4px; background:var(--surface); color:var(--ink); font:12px/1.45 var(--mono); white-space:pre-wrap; }
+
+  /* Sidebar overlay toggle — shown only below the breakpoint. Clicking
+     pops the rail back in as a floating overlay so the user can pick a
+     section, then it auto-dismisses. Click outside also closes. */
+  .rail-toggle { display:none; align-items:center; justify-content:center; width:34px; height:34px; padding:0; border:1px solid var(--surface-2); background:var(--surface); color:var(--ink); border-radius:6px; cursor:pointer; flex-shrink:0; margin-right:10px; }
+  .rail-toggle:hover { background:var(--surface-2); }
+  .rail-toggle svg { width:16px; height:16px; }
+  .rail-scrim { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:80; }
+
+  @media (max-width: 880px) {
+    .app { grid-template-columns:1fr; }
+    aside.rail { display:none; }
+    .rail-toggle { display:inline-flex; }
+    body.rail-open aside.rail { display:grid; position:fixed; left:0; top:0; bottom:0; width:240px; z-index:90; box-shadow:0 0 24px rgba(0,0,0,0.45); }
+    body.rail-open .rail-scrim { display:block; }
+  }
+  @media (max-width: 720px) {
+    .topbar { height:auto; min-height:52px; padding:8px 10px; gap:8px; flex-wrap:wrap; }
+    .topbar .spacer { display:none; }
+    .crumbs { flex:1 1 auto; min-width:0; gap:6px; }
+    .crumbs > span:first-child { max-width:86px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .crumbs .here { max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .topbar .search { order:2; width:100%; flex:1 0 100%; }
+    .topbar kbd { display:none; }
+    .signin { padding:7px 10px; font-size:12px; white-space:nowrap; }
+    .theme-toggle { width:34px; height:34px; flex-shrink:0; }
+    .tele-strip { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); overflow-x:visible; }
+    .tele-cell { min-width:0; padding:10px 12px; border-right:1px solid var(--rule); border-bottom:1px solid var(--rule); }
+    .tele-cell:nth-child(2n) { border-right:none; }
+    .tele-cell:last-child { grid-column:1 / -1; border-right:none; }
+    .tele-cell .sub { overflow-wrap:anywhere; }
+    .pane-scroll { padding:20px 14px 30px; overflow-x:hidden; }
+    .pane { max-width:100%; min-width:0; }
+    h1.pane-title { font-size:21px; }
+    p.pane-lede { font-size:14px; max-width:100%; }
+    .ov-grid { grid-template-columns:1fr; gap:12px; }
+    .ov-tile, .ov-tile.s4, .ov-tile.s8, .ov-tile.s12 { grid-column:1; min-width:0; }
+    .ov-tile { padding:14px; overflow:hidden; }
+    .log-table { width:100%; table-layout:fixed; }
+    .log-table td { padding:5px 6px; white-space:normal; overflow:hidden; text-overflow:ellipsis; }
+    .log-table td.ts { width:62px; }
+    .log-table td.st { width:38px; }
+    .log-table td.ms, .log-table td.dt { display:none; }
+    .block { overflow-x:auto; }
+    .block-head { align-items:flex-start; flex-wrap:wrap; }
+    .block-head .sub { flex-basis:100%; }
+    .safety-bar { grid-template-columns:1fr; }
+    .safety-cell { grid-template-columns:auto 1fr auto; padding:12px 14px; }
+    .perm-toolbar, .perm-bulkbar { padding:10px 12px; align-items:flex-start; }
+    .perm-toolbar .filter-group { max-width:100%; overflow-x:auto; }
+    .perm-toolbar .filter-group button { white-space:nowrap; }
+    .perm-toolbar .count-readout { width:100%; margin-left:0; }
+    .perm-table { min-width:680px; }
+    .perm-table td.col-nm { white-space:normal; overflow-wrap:anywhere; }
+    .kv { grid-template-columns:1fr; gap:2px; }
+    .desktop-metrics { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+    .desktop-metric.wide { grid-column:1 / -1; }
+    .drawer { width:100vw; max-width:100vw; }
+    .drawer-body { padding:16px; }
+    .drawer-body .fields { grid-template-columns:1fr; }
+  }
+</style>
+</head>
+<body data-view="${signedIn ? 'signedin' : 'signedout'}" data-theme="light">
+
+<div class="app">
+
+  <aside class="rail">
+    <div class="rail-head">
+      <div class="rail-brand"><span>empir<span class="three">3</span></span><span class="sub">Bridge</span></div>
+      <div class="rail-tag"><span class="live"></span>BRIDGE ${BRIDGE_VERSION} · LIVE</div>
+    </div>
+
+    <nav class="rail-nav">
+      <div class="rail-section-label">Console</div>
+      <a data-nav="overview" class="active">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="5" height="6" rx="0.6"/><rect x="9" y="2" width="5" height="4" rx="0.6"/><rect x="2" y="10" width="5" height="4" rx="0.6"/><rect x="9" y="8" width="5" height="6" rx="0.6"/></svg>
+        Overview
+      </a>
+      <a data-nav="permissions">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1L2 4v4c0 3.5 2.5 6.5 6 7 3.5-.5 6-3.5 6-7V4L8 1z"/><path d="M5.5 8l2 2 3-3.5"/></svg>
+        Permissions
+        <span class="count" id="sidebarPermCount">${toolCount}</span>
+      </a>
+      <a data-nav="mcp">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4l-3 4 3 4M12 4l3 4-3 4M10 2L6 14"/></svg>
+        MCP Connection
+      </a>
+      <a data-nav="clis">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h12v10H2z"/><path d="M4 6l2 2-2 2M8 10h4"/></svg>
+        API &amp; CLIs
+      </a>
+      <a data-nav="agent">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="12" height="12" rx="1"/><path d="M6 6h4v4H6z"/></svg>
+        Desktop Tools
+      </a>
+      <a data-nav="account">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="6" r="3"/><path d="M2 14c0-3 2.5-5 6-5s6 2 6 5"/></svg>
+        empir3 Account
+      </a>
+
+      <div class="rail-section-label">System</div>
+      <a data-nav="daemon">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.4"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M3.2 12.8l1.4-1.4M11.4 4.6l1.4-1.4"/></svg>
+        Daemon
+      </a>
+      <a data-nav="updates">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 8a6 6 0 0 1 10-4.5L14 5M14 8a6 6 0 0 1-10 4.5L2 11M11 5h3V2M5 11H2v3"/></svg>
+        Updates
+      </a>
+      <a data-nav="logs">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2h7l3 3v9H3V2zM10 2v3h3M5 8h6M5 11h6"/></svg>
+        Activity Log
+      </a>
+      <a data-nav="lifecycle" class="danger">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1L1 14h14L8 1zM8 6v4M8 12v.5"/></svg>
+        Tray Lifecycle
+      </a>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="row"><span class="led" id="footDaemonLed"></span><span class="k">daemon</span><span style="margin-left:auto" id="footDaemonUptime">—</span></div>
+      <div class="row"><span class="led" id="footMcpLed"></span><span class="k">mcp</span><span style="margin-left:auto" id="footMcpCount">—</span></div>
+      <div class="row"><span class="led${signedIn ? '' : ' warn'}" id="footRelayLed"></span><span class="k">relay</span><span style="margin-left:auto" id="footRelayState">${signedIn ? 'connected' : 'unpaired'}</span></div>
+    </div>
+  </aside>
+
+  <div class="rail-scrim" id="railScrim"></div>
+
+  <main class="console">
+
+    <div class="topbar">
+      <button class="rail-toggle" type="button" id="railToggle" title="Show navigation" aria-label="Show navigation">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
+      </button>
+      <div class="crumbs">
+        <span>empir<span style="color:var(--accent); font-weight:700;">3</span> Bridge</span>
+        <span class="sep">/</span>
+        <span class="here" id="crumbHere">Overview</span>
+      </div>
+      <div class="spacer"></div>
+      <div class="search">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="5"/><path d="M14 14l-3-3"/></svg>
+        <input placeholder="Search tools, settings…" id="globalSearch" />
+        <kbd>⌘K</kbd>
+      </div>
+      <button class="theme-toggle" type="button" id="themeToggle" title="Toggle theme" aria-label="Toggle theme">
+        <svg class="sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M3.2 12.8l1.4-1.4M11.4 4.6l1.4-1.4"/></svg>
+        <svg class="moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 9.5A5.5 5.5 0 0 1 6.5 2.5a6 6 0 1 0 7 7z"/></svg>
+      </button>
+      <button class="signin when-signedout" type="button" id="openSignIn">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 11l3-3-3-3M13 8H6M9 14H4a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h5"/></svg>
+        Sign in with <span class="brand-inline">empir<span class="three">3</span></span>
+      </button>
+      <button class="acct when-signedin" type="button" id="openAccount">
+        <span class="av" id="acctAvatar">··</span><span class="em" id="acctEmail">loading…</span><span class="car">▾</span>
+      </button>
+    </div>
+
+    <div class="tele-strip">
+      <div class="tele-cell">
+        <div class="lbl"><span class="led" id="teleDaemonLed"></span>Daemon</div>
+        <div class="val" id="teleDaemonVal">RUNNING</div>
+        <div class="sub" id="teleDaemonSub">PID ${process.pid} · uptime —</div>
+      </div>
+      <div class="tele-cell">
+        <div class="lbl"><span class="led" id="teleMcpLed"></span>MCP</div>
+        <div class="val" id="teleMcpVal">READY</div>
+        <div class="sub" id="teleMcpSub">stdio · — calls / — errors</div>
+      </div>
+      <div class="tele-cell">
+        <div class="lbl"><span class="led idle" id="teleAgentLed"></span>Agent</div>
+        <div class="val" id="teleAgentVal">IDLE</div>
+        <div class="sub" id="teleAgentSub">no focus region</div>
+      </div>
+      <div class="tele-cell">
+        <div class="lbl"><span class="led${signedIn ? '' : ' warn'}" id="teleRelayLed"></span>Relay</div>
+        <div class="val" id="teleRelayVal">—</div>
+        <div class="sub" id="teleRelaySub">—</div>
+      </div>
+      <div class="tele-cell">
+        <div class="lbl"><span class="led" id="teleSafetyLed"></span>Safety</div>
+        <div class="val" id="teleSafetyVal">— / — / —</div>
+        <div class="sub" id="teleSafetySub">—</div>
+      </div>
+    </div>
+
+    <div class="pane-scroll">
+
+      <section class="pane active" data-pane="overview">
+        <h1 class="pane-title">Overview</h1>
+        <p class="pane-lede">The <span class="brand-inline">empir<span class="three">3</span></span> Bridge is the local Chrome bridge for Claude Code, Claude Desktop, OpenAI, and any other MCP client. Everything runs on this PC.</p>
+
+        <div class="ov-grid">
+
+          <div class="ov-tile s4">
+            <h3>Daemon</h3>
+            <div class="big" id="ovDaemonUptime">—</div>
+            <p>Process <span class="mono">empir3-bridge</span> · wrapper <span class="mono">:${PORT}</span> · <span id="ovDaemonPid">PID ${process.pid}</span></p>
+            <div class="actions">
+              <button class="btn small" id="ovOpenBridge" type="button">Open bridge window</button>
+              <button class="btn small ghost" id="ovReconnect" type="button">Reconnect</button>
+            </div>
+            <p class="status" id="ovDaemonStatus"></p>
+          </div>
+
+          <div class="ov-tile s4">
+            <h3>MCP Calls (last 80)</h3>
+            <div class="big" id="ovMcpCalls">— <span style="color:var(--soft); font-size:14px;">/ — err</span></div>
+            <p id="ovMcpLast">Loading recent activity…</p>
+            <div class="actions">
+              <button class="btn small" data-goto="logs" type="button">View call log</button>
+              <button class="btn small ghost" data-goto="mcp" type="button">Show config</button>
+            </div>
+          </div>
+
+          <div class="ov-tile s4">
+            <h3>Permissions</h3>
+            <div class="big" id="ovPermSummary">— / ${toolCount}</div>
+            <p id="ovPermTags"><span class="tag good">—</span></p>
+            <div class="actions">
+              <button class="btn small" data-goto="permissions" type="button">Manage permissions →</button>
+            </div>
+          </div>
+
+          <div class="ov-tile s8">
+            <h3>Recent activity</h3>
+            <table class="log-table" id="ovLogTable">
+              <tbody id="ovLogRows"><tr><td class="dt" style="text-align:center;">No activity yet.</td></tr></tbody>
+            </table>
+          </div>
+
+          <div class="ov-tile s4">
+            <h3>Relay</h3>
+            <div class="big when-signedout" style="color: var(--warn)">UNPAIRED</div>
+            <div class="big good when-signedin" id="ovRelayStatus">CONNECTED</div>
+            <p class="when-signedout">Sign in with <span class="brand-inline">empir<span class="three">3</span></span> to relay browser tools to your agents.</p>
+            <p class="when-signedin"><span class="mono" id="ovRelayUser">—</span> · <span class="mono" id="ovRelayServer">—</span></p>
+            <div class="actions">
+              <button class="btn small primary when-signedout" type="button" onclick="openDrawer()">Sign in</button>
+              <button class="btn small when-signedin" data-goto="account" type="button">Manage account</button>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="pane" data-pane="permissions">
+        <h1 class="pane-title">Permissions</h1>
+        <p class="pane-lede">Every bridge tool can be allowed or blocked at the PC level. Disabled tools never appear in the MCP client's inventory — same model as Anthropic computer-use, macOS Accessibility, or Chrome extension permissions: explicit consent, no AI judgment.</p>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">00</span>
+            <span class="title">Global Safety Override</span>
+            <span class="spacer"></span>
+            <span class="sub">The final PC-level switch. Disabling a category blocks every tool in it regardless of fine-tune.</span>
+          </div>
+          <div class="safety-bar">
+            <label class="safety-cell">
+              <span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z"/><circle cx="8" cy="8" r="2"/></svg></span>
+              <div class="meta"><div class="name">Read</div><div class="sub">Screenshots, page text, snapshots, status</div></div>
+              <span class="sw"><input type="checkbox" data-safety="read"><span class="s"></span></span>
+            </label>
+            <label class="safety-cell">
+              <span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2 2L5 13H3v-2l8.5-8.5z"/></svg></span>
+              <div class="meta"><div class="name">Write</div><div class="sub">Overlay chat, recordings, safety lockdown</div></div>
+              <span class="sw"><input type="checkbox" data-safety="write"><span class="s"></span></span>
+            </label>
+            <label class="safety-cell">
+              <span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2l9 6-9 6V2z"/></svg></span>
+              <div class="meta"><div class="name">Execute</div><div class="sub">Click, type, navigate, drag, run JS</div></div>
+              <span class="sw"><input type="checkbox" data-safety="execute"><span class="s"></span></span>
+            </label>
+          </div>
+          <p class="status" id="safetyStatus" style="padding:8px 16px 12px;"></p>
+        </div>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">01</span>
+            <span class="title">Tool-by-tool Permissions</span>
+            <span class="spacer"></span>
+            <span class="sub">${toolCount} tools across 7 groups</span>
+          </div>
+          <div class="perm-bulkbar">
+            <div class="bulk-actions">
+              <button class="btn small" type="button" data-bulk="enable-all">Enable all</button>
+              <button class="btn small" type="button" data-bulk="default">Restore defaults</button>
+              <button class="btn small" type="button" data-bulk="disable-all">Disable all</button>
+            </div>
+            <div class="scope-note">
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><circle cx="8" cy="8" r="6.5"/><path d="M8 4.5v4M8 11v.5"/></svg>
+              <span>Disabling a tool blocks it everywhere — MCP, local chat, and <span class="brand-inline">empir<span class="three">3</span></span> relay.</span>
+            </div>
+          </div>
+          <div class="perm-toolbar">
+            <div class="filter-group" role="tablist">
+              <button class="on" data-filter="all">All</button>
+              <button data-filter="advisor">Advisor</button>
+              <button data-filter="read">Read</button>
+              <button data-filter="navigate">Navigate</button>
+              <button data-filter="interact">Interact</button>
+              <button data-filter="desktop">Desktop</button>
+              <button data-filter="eval">Eval</button>
+              <button data-filter="recordings">Recordings</button>
+              <button data-filter="higgsfield">Higgsfield</button>
+            </div>
+            <div class="count-readout"><span class="num" id="enabledCount">—</span> / <span class="num" id="visibleToolCount">${toolCount}</span> enabled</div>
+          </div>
+          <div style="overflow-x:auto;">
+            <table class="perm-table">
+              <thead>
+                <tr><th>On</th><th>Tool</th><th>Group</th><th>What it does</th></tr>
+              </thead>
+              <tbody id="permRows"></tbody>
+            </table>
+          </div>
+          <p class="status" id="permStatus" style="padding:8px 16px 12px;"></p>
+        </div>
+      </section>
+
+      <section class="pane" data-pane="mcp">
+        <h1 class="pane-title">MCP Connection</h1>
+        <p class="pane-lede">Add the <span class="brand-inline">empir<span class="three">3</span></span> Bridge as a stdio MCP server in Claude Code, Claude Desktop, OpenAI, or any other client.</p>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">01</span>
+            <span class="title">stdio Config</span>
+            <span class="spacer"></span>
+            <span class="tag good">READY</span>
+          </div>
+          <div class="block-body">
+            <div style="display:flex; gap:8px; margin-bottom:12px;">
+              <button class="btn primary" id="mcpShowConfig" type="button">Show config</button>
+              <button class="btn" id="mcpCopyConfig" type="button">Copy snippet</button>
+            </div>
+            <pre class="snippet" id="mcpSnippet">Click "Show config" to generate the snippet for this install.</pre>
+            <ol id="mcpSteps" style="margin:14px 0 0; padding-left:20px; color:var(--muted); line-height:1.7; font-size:13px;">
+              <li>Save the config as <code style="background:var(--surface-2); padding:1px 6px; border-radius:3px;">.mcp.json</code> in your project root.</li>
+              <li>Restart your MCP client from that folder.</li>
+              <li>Ask the client to use the <span class="brand-inline">empir<span class="three">3</span></span> Bridge browser or desktop tools.</li>
+            </ol>
+            <p class="status" id="mcpStatus" style="margin-top:10px;"></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane" data-pane="clis">
+        <h1 class="pane-title">API &amp; CLIs</h1>
+        <p class="pane-lede">Local CLIs the bridge knows about, the API keys it can hold, and which inference CLIs you've opted-in to lend to <span class="brand-inline">empir<span class="three">3</span></span> team agents.</p>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">01</span>
+            <span class="title">Installed CLIs</span>
+            <span class="spacer"></span>
+            <span class="tag" id="cliInstalledTag">— / —</span>
+          </div>
+          <div class="block-body">
+            <div style="overflow-x:auto;">
+              <table class="perm-table" style="font-size:13px;">
+                <thead>
+                  <tr>
+                    <th style="width:24%;">CLI</th>
+                    <th style="width:20%;">Install</th>
+                    <th style="width:18%;">Auth</th>
+                    <th style="width:20%;" title="For inference CLIs: lend to empir3 team agents. For handler CLIs: gate whether the bridge advertises the tools at all.">Lend / Tools</th>
+                    <th style="width:18%;">Action</th>
+                  </tr>
+                </thead>
+                <tbody id="cliRows">
+                  <tr><td colspan="5" class="dt" style="text-align:center; color:var(--soft);">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:14px;">
+              <button class="btn" type="button" id="addCustomProviderBtn">+ Add custom provider</button>
+              <span style="font-size:11.5px; color:var(--soft); align-self:center;">OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, vLLM, etc)</span>
+            </div>
+            <p class="status" id="cliStatus" style="margin-top:10px;"></p>
+          </div>
+        </div>
+
+        <!-- Add Custom Provider modal -->
+        <div id="providerModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100; align-items:center; justify-content:center;">
+          <div style="background:var(--paper); color:var(--ink); border:1px solid var(--surface-2); border-radius:8px; max-width:640px; width:92%; max-height:90vh; overflow:auto; padding:24px;">
+            <div style="display:flex; align-items:center; margin-bottom:14px;">
+              <h2 style="margin:0; font-size:18px; font-weight:700;">Add custom provider</h2>
+              <button class="btn small ghost" type="button" id="providerModalClose" style="margin-left:auto;">✕</button>
+            </div>
+            <p style="margin:0 0 14px; color:var(--muted); font-size:13px;">Paste a JSON definition for an OpenAI-compatible provider. Must include <code>slug</code>, <code>name</code>, <code>apiBaseUrl</code>. <code>models</code> auto-populates from <code>/v1/models</code> if omitted; <code>apiKey</code> is optional (Ollama doesn't need one, OpenRouter does).</p>
+            <textarea id="providerModalJson" spellcheck="false" style="width:100%; min-height:240px; padding:12px; font-family:var(--mono); font-size:13px; background:var(--surface); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink); resize:vertical;" placeholder='{
+  "slug": "ollama-local",
+  "name": "Ollama (local)",
+  "apiBaseUrl": "http://localhost:11434/v1"
+}'></textarea>
+            <div style="display:flex; gap:8px; margin-top:12px;">
+              <button class="btn primary" type="button" id="providerModalSave">Add provider</button>
+              <button class="btn ghost" type="button" id="providerModalCancel">Cancel</button>
+              <button class="btn small ghost" type="button" id="providerModalExample" style="margin-left:auto;">Insert example</button>
+            </div>
+            <p class="status" id="providerModalStatus" style="margin-top:10px;"></p>
+          </div>
+        </div>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">02</span>
+            <span class="title">API Keys</span>
+            <span class="spacer"></span>
+            <span class="tag" id="apiKeysTag">— set</span>
+          </div>
+          <div class="block-body">
+            <p style="margin:0 0 14px; color:var(--muted); font-size:13px;">Keys stay on this PC in <code style="background:var(--surface-2); padding:1px 6px; border-radius:3px;">~/.empir3-bridge/config.json</code> (chmod&nbsp;600). Used when an MCP client or empir3 agent picks the direct-API route instead of a local CLI. Leave blank to keep the existing value — submitting an empty field never clobbers a saved key.</p>
+            <div class="kv" style="grid-template-columns: 140px 1fr; gap:10px 14px;">
+              <div class="k">Anthropic</div><div class="v"><input type="password" id="apiKeyAnthropic" placeholder="sk-ant-…" autocomplete="off" style="width:100%; padding:7px 10px; font-family:var(--mono); background:var(--surface); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink);"></div>
+              <div class="k">OpenAI</div><div class="v"><input type="password" id="apiKeyOpenai" placeholder="sk-…" autocomplete="off" style="width:100%; padding:7px 10px; font-family:var(--mono); background:var(--surface); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink);"></div>
+              <div class="k">Google</div><div class="v"><input type="password" id="apiKeyGoogle" placeholder="AIza…" autocomplete="off" style="width:100%; padding:7px 10px; font-family:var(--mono); background:var(--surface); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink);"></div>
+              <div class="k">xAI (Grok)</div><div class="v"><input type="password" id="apiKeyXai" placeholder="xai-…" autocomplete="off" style="width:100%; padding:7px 10px; font-family:var(--mono); background:var(--surface); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink);"></div>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:14px;">
+              <button class="btn primary" id="apiKeysSave" type="button">Save keys</button>
+              <button class="btn" id="apiKeysReveal" type="button">Show/hide</button>
+            </div>
+            <p class="status" id="apiKeysStatus" style="margin-top:10px;"></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane" data-pane="agent">
+        <h1 class="pane-title">Desktop Tools</h1>
+        <p class="pane-lede">Open the safe desktop-test harness, inspect the controlled browser window, and scope desktop actions before clicking real apps.</p>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">01</span>
+            <span class="title">Bridge Test Harness</span>
+            <span class="spacer"></span>
+            <span class="tag" id="dtBridgeTag">CHECKING</span>
+          </div>
+          <div class="block-body">
+            <div class="desktop-metrics">
+              <div class="desktop-metric">
+                <div class="label">Bridge</div>
+                <div class="value" id="dtBridgeStatus">Checking</div>
+              </div>
+              <div class="desktop-metric">
+                <div class="label">Messages</div>
+                <div class="value" id="dtMessageCount">0</div>
+              </div>
+              <div class="desktop-metric">
+                <div class="label">Overlay</div>
+                <div class="value" id="dtOverlayStatus">-</div>
+              </div>
+              <div class="desktop-metric">
+                <div class="label">Safety</div>
+                <div class="value" id="dtSafetyStatus">-</div>
+              </div>
+              <div class="desktop-metric wide">
+                <div class="label">Current URL</div>
+                <div class="value small mono" id="dtCurrentUrl">-</div>
+              </div>
+              <div class="desktop-metric wide">
+                <div class="label">Control Detail</div>
+                <div class="value small" id="dtSafetyDetail">read - write - execute</div>
+              </div>
+            </div>
+            <div class="desktop-actions">
+              <button class="btn primary" id="dtOpenDesktopTest" type="button">Open desktop test</button>
+              <button class="btn" id="dtBrowserScreenshot" type="button">Screenshot</button>
+              <button class="btn" id="dtBrowserRefresh" type="button">Refresh</button>
+              <button class="btn" id="dtBrowserSnapshot" type="button">Snapshot</button>
+              <button class="btn" id="dtInjectOverlay" type="button">Inject overlay</button>
+              <button class="btn danger" id="dtRevokeControl" type="button">Revoke write control</button>
+            </div>
+            <pre class="desktop-output" id="dtCommandOutput"></pre>
+            <p class="status" id="desktopToolsStatus" style="margin-top:10px;"></p>
+          </div>
+        </div>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">02</span>
+            <span class="title">Focus Region</span>
+            <span class="spacer"></span>
+            <span class="tag" id="focusTag">NONE LOCKED</span>
+          </div>
+          <div class="block-body">
+            <div class="kv">
+              <div class="k">Status</div><div class="v" id="focusStatusText">No region — agent sees full virtual screen</div>
+              <div class="k">TTL</div><div class="v mono" id="focusTtl">—</div>
+              <div class="k">Bounds</div><div class="v mono" id="focusBounds">—</div>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:14px; flex-wrap:wrap;">
+              <button class="btn primary" id="agtSelectRegion" type="button">Select region…</button>
+              <button class="btn" id="agtReleaseFocus" type="button" disabled>Release focus</button>
+              <button class="btn" id="agtFocusGrid" type="button" disabled>Show focus grid</button>
+            </div>
+            <p class="status" id="agentStatus" style="margin-top:8px;"></p>
+          </div>
+        </div>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">03</span>
+            <span class="title">Click Calibration</span>
+            <span class="spacer"></span>
+            <span class="tag" id="calibrationTag">UNCALIBRATED</span>
+          </div>
+          <div class="block-body">
+            <div class="kv">
+              <div class="k">Offset X</div><div class="v mono" id="calOffsetX">—</div>
+              <div class="k">Offset Y</div><div class="v mono" id="calOffsetY">—</div>
+              <div class="k">Last run</div><div class="v mono" id="calLastRun">—</div>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:14px;">
+              <button class="btn" id="agtCalibrate" type="button">Re-calibrate…</button>
+            </div>
+            <p class="status" id="calStatus" style="margin-top:8px;"></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane" data-pane="account">
+        <h1 class="pane-title">empir3 Account</h1>
+        <p class="pane-lede">Pair this bridge with an <span class="brand-inline">empir<span class="three">3</span></span> account so agents can drive it remotely. The token stays on this PC.</p>
+
+        <div class="block when-signedout">
+          <div class="block-head">
+            <span class="ix">01</span>
+            <span class="title">Pairing</span>
+            <span class="spacer"></span>
+            <span class="tag warn">NOT PAIRED</span>
+          </div>
+          <div class="block-body">
+            <p style="margin:0 0 14px; color:var(--muted); font-size:13px;">Two ways to pair: use the empir3 account already in your browser, or sign in directly to store a token on this PC that survives browser logouts.</p>
+            <div style="display:flex; gap:8px;">
+              <button class="btn primary" type="button" onclick="openDrawer()">Sign in with <span class="brand-inline">empir<span class="three">3</span></span></button>
+            </div>
+          </div>
+        </div>
+
+        <div class="block when-signedin">
+          <div class="block-head">
+            <span class="ix">01</span>
+            <span class="title">Paired Account</span>
+            <span class="spacer"></span>
+            <span class="tag good" id="acctConnTag">CONNECTED</span>
+          </div>
+          <div class="block-body">
+            <div class="kv">
+              <div class="k">Account</div><div class="v" id="acctPaneEmail">—</div>
+              <div class="k">Server</div><div class="v mono" id="acctPaneServer">—</div>
+              <div class="k">Mode</div><div class="v" id="acctPaneMode">—</div>
+              <div class="k">Device</div><div class="v mono" id="acctPaneDevice">—</div>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:14px;">
+              <button class="btn danger" id="acctSignOut" type="button">Sign out</button>
+            </div>
+            <p class="status" id="acctStatus" style="margin-top:8px;"></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane" data-pane="daemon">
+        <h1 class="pane-title">Daemon</h1>
+        <p class="pane-lede">The <span class="brand-inline">empir<span class="three">3</span></span> Bridge process and the Chrome window it drives.</p>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">01</span>
+            <span class="title">Process</span>
+            <span class="spacer"></span>
+            <span class="tag good" id="daemonHealthTag">HEALTHY</span>
+          </div>
+          <div class="block-body">
+            <div class="kv">
+              <div class="k">PID</div><div class="v mono" id="daemonPid">${process.pid}</div>
+              <div class="k">Uptime</div><div class="v mono" id="daemonUptime">—</div>
+              <div class="k">Bridge URL</div><div class="v mono" id="daemonBridgeUrl">http://localhost:${PORT}</div>
+              <div class="k">Version</div><div class="v mono">${BRIDGE_VERSION}</div>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:14px; flex-wrap:wrap;">
+              <button class="btn" id="daemonOpenBridge" type="button">Open bridge window</button>
+              <button class="btn" id="daemonReconnect" type="button">Reconnect daemon</button>
+              <button class="btn ghost" id="daemonToggleLog" type="button">Show log</button>
+            </div>
+            <pre class="snippet" id="daemonLog" style="display:none; max-height:260px; margin-top:12px;"></pre>
+            <p class="status" id="daemonStatus" style="margin-top:8px;"></p>
+          </div>
+        </div>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">02</span>
+            <span class="title">Identity</span>
+            <span class="spacer"></span>
+            <span class="tag" id="identityTag">—</span>
+          </div>
+          <div class="block-body">
+            <p style="margin:0 0 14px; color:var(--muted); font-size:13px;">How this PC is labeled in <span class="brand-inline">empir<span class="three">3</span></span> agents and where bridge-side file ops (project sync, file pulls/pushes) are scoped.</p>
+            <div class="kv" style="grid-template-columns: 150px 1fr; gap:10px 14px;">
+              <div class="k">Device name</div><div class="v"><input type="text" id="deviceNameInput" placeholder="MSI" autocomplete="off" style="width:100%; padding:7px 10px; font-family:var(--mono); background:var(--surface); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink);"></div>
+              <div class="k">Home directory</div><div class="v"><input type="text" id="homeDirInput" placeholder="C:\\Users\\you\\Documents\\Empir3" autocomplete="off" style="width:100%; padding:7px 10px; font-family:var(--mono); background:var(--surface); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink);"></div>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:14px;">
+              <button class="btn primary" id="identitySave" type="button">Save identity</button>
+              <button class="btn ghost" id="identityReset" type="button">Reset to current</button>
+            </div>
+            <p class="status" id="identityStatus" style="margin-top:10px;"></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane" data-pane="updates">
+        <h1 class="pane-title">Updates</h1>
+        <p class="pane-lede">Bridge payloads ship as auto-updateable packages. You can hold a version or auto-apply.</p>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">01</span>
+            <span class="title">Version</span>
+            <span class="spacer"></span>
+            <span class="tag" id="updateTag">—</span>
+          </div>
+          <div class="block-body">
+            <div class="kv">
+              <div class="k">Installed</div><div class="v mono">${BRIDGE_VERSION}</div>
+              <div class="k">Available</div><div class="v mono" id="updateAvailable">—</div>
+              <div class="k">Last check</div><div class="v mono" id="updateLastCheck">—</div>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:14px;">
+              <button class="btn" id="updateCheck" type="button">Check now</button>
+              <button class="btn primary" id="updateApply" type="button" style="display:none;">Apply update (restarts tray)</button>
+            </div>
+            <p class="status" id="updateStatus" style="margin-top:8px;"></p>
+          </div>
+        </div>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">02</span>
+            <span class="title">Policy</span>
+          </div>
+          <div class="block-body">
+            <label style="display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid var(--line); border-radius:5px; background:var(--surface); cursor:pointer;">
+              <span class="sw"><input type="checkbox" id="autoUpdateToggle"><span class="s"></span></span>
+              <span style="font-size:13px;"><strong>Auto-update</strong> — apply new bridge payloads automatically as they ship.</span>
+            </label>
+            <p class="status" id="policyStatus" style="margin-top:8px;"></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane" data-pane="logs">
+        <h1 class="pane-title">Activity Log</h1>
+        <p class="pane-lede">Recent tool calls captured by the action log.</p>
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">01</span>
+            <span class="title">Action Log</span>
+            <span class="spacer"></span>
+            <button class="btn small ghost" id="logsRefresh" type="button">Refresh</button>
+          </div>
+          <div class="block-body">
+            <table class="log-table" id="logsTable">
+              <tbody id="logsRows"><tr><td class="dt" style="text-align:center;">Loading…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane" data-pane="lifecycle">
+        <h1 class="pane-title" style="color: var(--bad);">Tray Lifecycle</h1>
+        <p class="pane-lede">These restart or remove the running tray. Each click asks for confirmation. Uninstall is irreversible.</p>
+
+        <div class="block" style="border-color: rgba(178,36,31,0.28);">
+          <div class="block-head" style="background: var(--bad-soft); border-bottom-color: rgba(178,36,31,0.18);">
+            <span class="ix" style="color:var(--bad);">!!</span>
+            <span class="title" style="color:var(--bad);">Destructive Actions</span>
+            <span class="spacer"></span>
+            <span class="tag bad">CONFIRMATION REQUIRED</span>
+          </div>
+          <div class="block-body">
+            <div style="display:grid; gap:10px;">
+              <div style="display:grid; grid-template-columns: 1fr auto; gap:14px; align-items:center; padding:12px; border:1px solid var(--line); border-radius:5px; background:var(--surface);">
+                <div>
+                  <div style="font-weight:700; font-size:13px;">Restart tray</div>
+                  <div style="font-size:11.5px; color:var(--muted); margin-top:1px;">The bridge daemon will restart with it. Active MCP sessions reconnect automatically.</div>
+                </div>
+                <button class="btn danger" id="lifeRestart" type="button">Restart tray</button>
+              </div>
+              <div style="display:grid; grid-template-columns: 1fr auto; gap:14px; align-items:center; padding:12px; border:1px solid var(--line); border-radius:5px; background:var(--surface);">
+                <div>
+                  <div style="font-weight:700; font-size:13px;">Quit Empir3</div>
+                  <div style="font-size:11.5px; color:var(--muted); margin-top:1px;">Tray icon disappears, bridge daemon stops. MCP clients lose connection.</div>
+                </div>
+                <button class="btn danger" id="lifeQuit" type="button">Quit Empir3</button>
+              </div>
+              <div style="display:grid; grid-template-columns: 1fr auto; gap:14px; align-items:center; padding:12px; border:1px solid var(--bad); border-radius:5px; background:var(--bad-soft);">
+                <div>
+                  <div style="font-weight:700; font-size:13px; color:var(--bad);">Uninstall Empir3</div>
+                  <div style="font-size:11.5px; color:var(--muted); margin-top:1px;">Wipes Chrome profile, auth, settings, autostart entry, Start Menu shortcut, and cached payloads. Irreversible.</div>
+                </div>
+                <button class="btn danger" id="lifeUninstall" type="button">Uninstall…</button>
+              </div>
+            </div>
+            <p class="status" id="lifeStatus" style="margin-top:10px;"></p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<div class="backdrop" id="backdrop"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <span class="title">Sign in with <span class="brand-inline">empir<span class="three">3</span></span></span>
+    <span class="spacer"></span>
+    <button class="x" type="button" onclick="closeDrawer()" aria-label="Close">
+      <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+    </button>
+  </div>
+  <p class="sub">Pair this bridge with your <span class="brand-inline">empir<span class="three">3</span></span> account. The token stays on this PC.</p>
+  <div class="drawer-body">
+    <label>Server
+      <select id="serverPreset">
+        <option value="production">Production — app.empir3.com</option>
+        <option value="local-dev">Local dev — localhost:3005</option>
+        <option value="custom">Custom…</option>
+      </select>
+    </label>
+    <label id="customServerLabel" style="display:none;">Custom URL <input id="serverUrl" type="url" value="${EMPIR3_SERVER}"></label>
+    <button class="btn primary" id="pairEmpir3" type="button" style="width:100%;">Use browser <span class="brand-inline">empir<span class="three">3</span></span> login</button>
+    <p class="hint">Reuses the <span class="brand-inline">empir<span class="three">3</span></span> account you're already signed into in your browser.</p>
+    <div class="divider">or sign in directly</div>
+    <form id="loginForm" style="display:grid; gap:10px;">
+      <div class="fields">
+        <label>Email<input type="email" id="loginEmail" autocomplete="username" placeholder="you@example.com"></label>
+        <label>Password<input type="password" id="loginPassword" autocomplete="current-password" placeholder="••••••••"></label>
+      </div>
+      <button class="btn" type="submit" style="width:100%;">Sign in and store on this bridge</button>
+    </form>
+    <p class="hint">Stores a long-lived bridge token locally, independent of your browser session.</p>
+    <p class="status" id="drawerStatus"></p>
+  </div>
+</aside>
+
+<script>
+  // ────── Constants from server ──────
+  const API = ${JSON.stringify(api)};
+  const TOOLS = ${toolsJson};
+  TOOLS.forEach(function(t){ t.on = t.d; });
+  const PROD_SERVER = ${JSON.stringify(DEFAULT_EMPIR3_SERVER)};
+  const DEV_SERVER  = ${JSON.stringify(LOCAL_DEV_EMPIR3_SERVER)};
+  let SAFETY = { read: true, write: false, execute: false };
+
+  const GROUP_ORDER = ['advisor','read','navigate','interact','desktop','eval','recordings','higgsfield'];
+  const GROUP_LABEL = { advisor:'Advisor', read:'Read', navigate:'Navigate', interact:'Interact', desktop:'Desktop', eval:'JavaScript (Eval)', recordings:'Recordings & Chat', higgsfield:'Higgsfield CLI' };
+  const GROUP_TAG = { advisor:'good', read:'good', navigate:'accent', interact:'warn', desktop:'warn', eval:'bad', recordings:'', higgsfield:'accent' };
+
+  const $ = function(id){ return document.getElementById(id); };
+  function setText(id, v) { var el = $(id); if (el) el.textContent = v == null ? '—' : String(v); }
+  function setStatus(id, msg, tone) {
+    var el = $(id); if (!el) return;
+    el.classList.remove('ok','err','info');
+    if (tone) el.classList.add(tone);
+    el.textContent = msg || '';
+  }
+  function setMetricTone(id, tone) {
+    var el = $(id); if (!el) return;
+    el.classList.remove('good','warn','bad');
+    if (tone) el.classList.add(tone);
+  }
+  function escapeAttr(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+  function escapeHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  async function api(path, opts) {
+    var r = await fetch(API + path, opts);
+    var j = {}; try { j = await r.json(); } catch (_) {}
+    if (!r.ok && !j.ok) throw new Error(j.error || ('http ' + r.status));
+    return j;
+  }
+  async function getJson(path) { return (await fetch(API + path)).json(); }
+  async function postJson(path, body) {
+    return api(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {}) });
+  }
+
+  // ────── Permissions table ──────
+  // Map a tool group to its handler-family key in
+  // settings.handlers.<key>.enabled. Only handler families (Higgsfield,
+  // future Replicate/Runway/Suno) are gated this way — the core browser /
+  // desktop groups have no family layer above them. Returns null for the
+  // groups that bypass the family gate entirely.
+  function familyHandlerKey(grp) {
+    if (grp === 'higgsfield') return 'higgsfield';
+    return null;
+  }
+  function warnSvg() {
+    return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1L1 14h14L8 1zM8 6v4M8 12v.5"/></svg>';
+  }
+  function dependencyWarning(tool) {
+    if (!tool.r || !tool.on) return '';
+    if (SAFETY[tool.r]) return '';
+    var attrTitle = tool.r.toUpperCase() + ' is OFF on the global safety override — this tool will be blocked until you enable ' + tool.r + '.';
+    return ' <span class="dep-warn" title="' + escapeAttr(attrTitle) + '">' + warnSvg() + 'NEEDS ' + tool.r.toUpperCase() + '</span>';
+  }
+  function activeFilter() {
+    var btn = document.querySelector('.perm-toolbar .filter-group button.on');
+    return btn ? btn.dataset.filter : 'all';
+  }
+  var currentSearch = '';
+  function renderTable(filter) {
+    filter = filter || activeFilter();
+    var tbody = $('permRows'); if (!tbody) return;
+    tbody.innerHTML = '';
+    var q = currentSearch.trim().toLowerCase();
+    for (var gi = 0; gi < GROUP_ORDER.length; gi++) {
+      var grp = GROUP_ORDER[gi];
+      var rows = TOOLS.filter(function(t){
+        if (t.hidden) return false;
+        if (t.g !== grp) return false;
+        if (filter !== 'all' && filter !== grp) return false;
+        if (q && t.n.toLowerCase().indexOf(q) === -1 && (t.b||'').toLowerCase().indexOf(q) === -1) return false;
+        return true;
+      });
+      if (!rows.length) continue;
+      var onCount = rows.filter(function(r){ return r.on; }).length;
+      var hdr = document.createElement('tr');
+      hdr.className = 'group-header';
+      hdr.innerHTML =
+        '<td colspan="4">' +
+          '<span>' + escapeHtml(GROUP_LABEL[grp]) + '</span>' +
+          '<span class="count">' + onCount + ' / ' + rows.length + '</span>' +
+          '<span class="bulk">' +
+            '<button data-grp="' + grp + '" data-act="enable">enable all</button>' +
+            '<button data-grp="' + grp + '" data-act="default">defaults</button>' +
+            '<button data-grp="' + grp + '" data-act="disable">disable all</button>' +
+          '</span>' +
+        '</td>';
+      tbody.appendChild(hdr);
+      // Handler-family gate banner — when a family group is shown but its
+      // tray/handler gate is off, every row below is effectively dead. Say
+      // so plainly with a jump back to the API & CLIs pane.
+      var familyGated = familyHandlerKey(grp);
+      if (familyGated) {
+        var fEnabled = !!(CLI_STATE && CLI_STATE.bridge && CLI_STATE.bridge.handlers && CLI_STATE.bridge.handlers[familyGated] && CLI_STATE.bridge.handlers[familyGated].enabled);
+        if (!fEnabled) {
+          var banner = document.createElement('tr');
+          banner.innerHTML = '<td colspan="4" style="padding:10px 14px; background:rgba(243,156,18,0.08); border-left:3px solid var(--warn,#f39c12); color:var(--muted); font-size:12.5px;">' +
+            '⚠ Family gate is OFF — these tools won\\'t appear in any MCP client until you enable <strong>' + escapeHtml(GROUP_LABEL[grp]) + '</strong> on the ' +
+            '<a href="#" data-goto="clis" style="color:var(--accent); text-decoration:underline;">API &amp; CLIs</a> page.' +
+            '</td>';
+          tbody.appendChild(banner);
+        }
+      }
+      for (var i = 0; i < rows.length; i++) {
+        var t = rows[i];
+        var tr = document.createElement('tr');
+        if (!t.on) tr.classList.add('disabled');
+        if (t.g === 'eval') tr.classList.add('eval');
+        var dangerTag = t.g === 'eval' ? ' <span class="tag bad" style="margin-left:6px;">DANGER</span>' : '';
+        tr.innerHTML =
+          '<td class="col-tg"><label class="sw"><input type="checkbox" data-tool="' + t.n + '"' + (t.on?' checked':'') + '><span class="s"></span></label></td>' +
+          '<td class="col-nm">' + escapeHtml(t.n) + dangerTag + dependencyWarning(t) + '</td>' +
+          '<td class="col-tag"><span class="tag ' + (GROUP_TAG[t.g] || '') + '">' + t.g.toUpperCase() + '</span></td>' +
+          '<td class="col-blurb">' + escapeHtml(t.b) + '</td>';
+        tbody.appendChild(tr);
+      }
+    }
+    var visibleTools = TOOLS.filter(function(t){ return !t.hidden; });
+    var enabled = visibleTools.filter(function(t){ return t.on; }).length;
+    var blockedBySafety = visibleTools.filter(function(t){ return t.on && t.r && !SAFETY[t.r]; }).length;
+    var effective = enabled - blockedBySafety;
+    setText('enabledCount', enabled);
+    setText('visibleToolCount', visibleTools.length);
+    setText('sidebarPermCount', visibleTools.length);
+    setText('ovPermSummary', effective + ' / ' + visibleTools.length);
+    var ovTags = $('ovPermTags');
+    if (ovTags) {
+      var tags = '<span class="tag good">' + effective + ' READY</span>';
+      if (blockedBySafety) tags += ' <span class="tag warn" style="margin-left:4px;">' + blockedBySafety + ' NEED SAFETY</span>';
+      var disabled = visibleTools.length - enabled;
+      if (disabled) tags += ' <span class="tag" style="margin-left:4px;">' + disabled + ' BLOCKED</span>';
+      ovTags.innerHTML = tags;
+    }
+  }
+  document.querySelectorAll('.perm-toolbar .filter-group button').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      document.querySelectorAll('.perm-toolbar .filter-group button').forEach(function(b){ b.classList.remove('on'); });
+      btn.classList.add('on');
+      renderTable(btn.dataset.filter);
+    });
+  });
+  // Global ⌘K / Ctrl+K search — filters the permissions table by tool name
+  // or blurb substring as the user types, and auto-switches to the
+  // Permissions pane when something is queried.
+  var gs = $('globalSearch');
+  if (gs) {
+    gs.addEventListener('input', function(){
+      currentSearch = gs.value || '';
+      if (currentSearch.trim() && typeof goto === 'function') {
+        var permPane = document.querySelector('[data-pane="permissions"]');
+        if (permPane && !permPane.classList.contains('active')) goto('permissions');
+      }
+      renderTable();
+    });
+  }
+  document.addEventListener('keydown', function(e){
+    var isModK = (e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K');
+    if (isModK && gs) {
+      e.preventDefault();
+      gs.focus();
+      gs.select();
+    } else if (e.key === 'Escape' && document.activeElement === gs && gs.value) {
+      gs.value = '';
+      currentSearch = '';
+      renderTable();
+    }
+  });
+  // Save a single tool's enabled state to /api/settings/state
+  async function saveToolPatch(name, on) {
+    markLocalMutate();
+    setStatus('permStatus', 'Saving ' + name + '…', 'info');
+    try {
+      var patch = {}; patch[name] = on;
+      var r = await postJson('/api/settings/state', { chat: { enabledTools: patch } });
+      // server returns full state; sync our model
+      var et = (r && r.chat && r.chat.enabledTools) || {};
+      TOOLS.forEach(function(t){
+        // A tool absent from server's enabledTools means it's family-gated
+        // off (e.g. custom_llm when no custom providers exist). Treat as
+        // hidden — don't render the row, don't count in N / N.
+        t.hidden = !(t.n in et);
+        if (et[t.n] !== undefined) t.on = !!et[t.n];
+      });
+      renderTable();
+      // Per-tool toggle on Permissions affects the "N / N tools" readout
+      // in the API & CLIs row — keep them in sync without a full reload.
+      if (typeof renderCliRows === 'function' && CLI_STATE) renderCliRows();
+      setStatus('permStatus', 'Saved ' + name + ' = ' + (on?'on':'off') + '.', 'ok');
+    } catch (e) {
+      setStatus('permStatus', 'Failed to save: ' + e.message, 'err');
+      // revert UI by reloading
+      loadPermissionState();
+    }
+  }
+  async function saveBulkPatch(patchMap) {
+    markLocalMutate();
+    setStatus('permStatus', 'Saving ' + Object.keys(patchMap).length + ' tools…', 'info');
+    try {
+      var r = await postJson('/api/settings/state', { chat: { enabledTools: patchMap } });
+      var et = (r && r.chat && r.chat.enabledTools) || {};
+      TOOLS.forEach(function(t){
+        // A tool absent from server's enabledTools means it's family-gated
+        // off (e.g. custom_llm when no custom providers exist). Treat as
+        // hidden — don't render the row, don't count in N / N.
+        t.hidden = !(t.n in et);
+        if (et[t.n] !== undefined) t.on = !!et[t.n];
+      });
+      renderTable();
+      // Per-tool toggle on Permissions affects the "N / N tools" readout
+      // in the API & CLIs row — keep them in sync without a full reload.
+      if (typeof renderCliRows === 'function' && CLI_STATE) renderCliRows();
+      setStatus('permStatus', 'Saved.', 'ok');
+    } catch (e) {
+      setStatus('permStatus', 'Failed to save: ' + e.message, 'err');
+      loadPermissionState();
+    }
+  }
+  document.addEventListener('change', function(e){
+    if (e.target.matches && e.target.matches('input[data-tool]')) {
+      var name = e.target.dataset.tool;
+      var t = TOOLS.find(function(x){ return x.n === name; });
+      if (t) { t.on = e.target.checked; renderTable(); saveToolPatch(name, t.on); }
+    }
+  });
+  document.addEventListener('change', function(e){
+    if (e.target.matches && e.target.matches('input[data-safety]')) {
+      var key = e.target.dataset.safety;
+      var on = !!e.target.checked;
+      SAFETY[key] = on;
+      var row = e.target.closest('.safety-cell');
+      if (row) row.classList.toggle('on', on);
+      paintSafety(SAFETY);
+      renderTable();
+      saveSafety();
+    }
+  });
+  document.addEventListener('click', function(e){
+    var b = e.target.closest && e.target.closest('button[data-safety-toggle]');
+    if (!b) return;
+    var key = b.dataset.safetyToggle;
+    if (!(key in SAFETY)) return;
+    SAFETY[key] = !SAFETY[key];
+    paintSafety(SAFETY);
+    renderTable();
+    saveSafety();
+  });
+  document.addEventListener('click', function(e){
+    var b = e.target.closest && e.target.closest('button[data-grp]');
+    if (!b) return;
+    var act = b.dataset.act;
+    var patch = {};
+    TOOLS.filter(function(t){ return t.g === b.dataset.grp; }).forEach(function(t){
+      if (act === 'enable') t.on = true;
+      else if (act === 'disable') t.on = false;
+      else if (act === 'default') t.on = t.d;
+      patch[t.n] = t.on;
+    });
+    renderTable();
+    saveBulkPatch(patch);
+  });
+  document.addEventListener('click', function(e){
+    var b = e.target.closest && e.target.closest('button[data-bulk]');
+    if (!b) return;
+    var act = b.dataset.bulk;
+    var patch = {};
+    TOOLS.forEach(function(t){
+      if (act === 'enable-all') t.on = true;
+      else if (act === 'disable-all') t.on = false;
+      else if (act === 'default') t.on = t.d;
+      patch[t.n] = t.on;
+    });
+    renderTable();
+    saveBulkPatch(patch);
+  });
+
+  // ────── Global Safety persistence ──────
+  function paintSafety(s) {
+    if (!s) return;
+    SAFETY = { read: !!s.read, write: !!s.write, execute: !!s.execute };
+    document.querySelectorAll('input[data-safety]').forEach(function(input){
+      var k = input.dataset.safety;
+      input.checked = !!SAFETY[k];
+      var row = input.closest('.safety-cell');
+      if (row) row.classList.toggle('on', !!SAFETY[k]);
+    });
+    var v = (SAFETY.read?'R':'·') + ' / ' + (SAFETY.write?'W':'·') + ' / ' + (SAFETY.execute?'E':'·');
+    var detail = 'read ' + (SAFETY.read?'on':'off') + ' · write ' + (SAFETY.write?'on':'off') + ' · exec ' + (SAFETY.execute?'on':'off');
+    var topSafety = $('teleSafetyVal');
+    if (topSafety) {
+      topSafety.innerHTML = '<span class="safety-shortcuts">' +
+        '<button class="safety-shortcut ' + (SAFETY.read ? 'on' : 'off') + '" type="button" data-safety-toggle="read" aria-pressed="' + (SAFETY.read ? 'true' : 'false') + '" title="Toggle read permission">R</button>' +
+        '<span class="safety-divider">/</span>' +
+        '<button class="safety-shortcut ' + (SAFETY.write ? 'on' : 'off') + '" type="button" data-safety-toggle="write" aria-pressed="' + (SAFETY.write ? 'true' : 'false') + '" title="Toggle write permission">W</button>' +
+        '<span class="safety-divider">/</span>' +
+        '<button class="safety-shortcut ' + (SAFETY.execute ? 'on' : 'off') + '" type="button" data-safety-toggle="execute" aria-pressed="' + (SAFETY.execute ? 'true' : 'false') + '" title="Toggle execute permission">E</button>' +
+        '</span>';
+    }
+    setText('teleSafetySub', detail + ' · click R/W/E to toggle');
+    setText('dtSafetyStatus', v);
+    setText('dtSafetyDetail', detail);
+    setMetricTone('dtSafetyStatus', (!SAFETY.read && !SAFETY.write && !SAFETY.execute) ? 'bad' : ((SAFETY.write || SAFETY.execute) ? 'warn' : 'good'));
+    var led = $('teleSafetyLed');
+    if (led) {
+      led.classList.remove('warn','bad','idle');
+      if (!SAFETY.read && !SAFETY.write && !SAFETY.execute) led.classList.add('bad');
+      else if (SAFETY.read && !SAFETY.write && !SAFETY.execute) {/* default */}
+      else led.classList.remove('warn','bad','idle');
+    }
+  }
+  async function saveSafety() {
+    markLocalMutate();
+    setStatus('safetyStatus', 'Saving safety override…', 'info');
+    try {
+      var r = await postJson('/api/settings/state', { bridge: { globalSafety: SAFETY } });
+      paintSafety(r && r.bridge && r.bridge.globalSafety);
+      renderTable();
+      setStatus('safetyStatus', 'Saved.', 'ok');
+    } catch (e) {
+      setStatus('safetyStatus', 'Failed: ' + e.message, 'err');
+      loadPermissionState();
+    }
+  }
+
+  // ────── Initial settings load ──────
+  async function loadPermissionState() {
+    try {
+      var s = await getJson('/api/settings/state');
+      var et = (s.chat && s.chat.enabledTools) || {};
+      TOOLS.forEach(function(t){
+        // A tool absent from server's enabledTools means it's family-gated
+        // off (e.g. custom_llm when no custom providers exist). Treat as
+        // hidden — don't render the row, don't count in N / N.
+        t.hidden = !(t.n in et);
+        if (et[t.n] !== undefined) t.on = !!et[t.n];
+      });
+      paintSafety((s.bridge && s.bridge.globalSafety) || { read:true, write:false, execute:false });
+      renderTable();
+      // auto-update toggle
+      if ($('autoUpdateToggle')) $('autoUpdateToggle').checked = !!(s.bridge && s.bridge.autoUpdate !== false);
+    } catch (e) {
+      setStatus('permStatus', 'Could not load settings: ' + e.message, 'err');
+    }
+  }
+
+  // Track most recent local mutation so the background refresh doesn't clobber
+  // an in-flight save (POST → 200 → UI updates → background poll fires before
+  // user sees the result would briefly revert state).
+  var lastLocalMutate = 0;
+  function markLocalMutate() { lastLocalMutate = Date.now(); }
+  async function refreshSettingsIfQuiet() {
+    if (Date.now() - lastLocalMutate < 2500) return; // user is actively editing
+    try { await loadPermissionState(); } catch (_) {}
+  }
+
+  // ────── Live status / telemetry ──────
+  function formatUptime(ms) {
+    if (!ms || ms < 0) return '—';
+    var s = Math.floor(ms / 1000);
+    var h = Math.floor(s / 3600); s -= h*3600;
+    var m = Math.floor(s / 60); s -= m*60;
+    function pad(n){ return n < 10 ? '0' + n : '' + n; }
+    return pad(h) + ':' + pad(m) + ':' + pad(s);
+  }
+  function timeAgo(ts) {
+    if (!ts) return '—';
+    var d = (Date.now() - Date.parse(ts)) / 1000;
+    if (d < 60) return Math.floor(d) + 's ago';
+    if (d < 3600) return Math.floor(d/60) + 'm ago';
+    if (d < 86400) return Math.floor(d/3600) + 'h ago';
+    return Math.floor(d/86400) + 'd ago';
+  }
+  async function refreshStatus() {
+    try {
+      var s = await getJson('/api/status');
+      var rs = await getJson('/api/relay-status');
+      var uptimeMs = rs.uptimeMs || 0;
+      // Daemon telemetry
+      setText('teleDaemonVal', s.running ? 'RUNNING' : 'OFFLINE');
+      setText('teleDaemonSub', (s.pid ? 'PID ' + s.pid + ' · ' : '') + 'uptime ' + formatUptime(uptimeMs));
+      var dled = $('teleDaemonLed'); if (dled){ dled.classList.remove('warn','bad','idle'); if (!s.running) dled.classList.add('bad'); }
+      // Desktop tools harness telemetry
+      setText('dtBridgeStatus', s.running ? 'Connected' : 'Disconnected');
+      setMetricTone('dtBridgeStatus', s.running ? 'good' : 'bad');
+      var dtTag = $('dtBridgeTag');
+      if (dtTag) { dtTag.textContent = s.running ? 'CONNECTED' : 'OFFLINE'; dtTag.className = 'tag ' + (s.running ? 'good' : 'bad'); }
+      setText('dtCurrentUrl', s.currentUrl || '—');
+      setText('dtMessageCount', s.messageCount || 0);
+      setMetricTone('dtMessageCount', (s.messageCount || 0) > 0 ? 'warn' : '');
+      setText('dtOverlayStatus', s.overlayInjected ? 'Active' : 'Not injected');
+      setMetricTone('dtOverlayStatus', s.overlayInjected ? 'good' : 'warn');
+      // Overview daemon tile
+      setText('ovDaemonUptime', formatUptime(uptimeMs));
+      setText('ovDaemonPid', s.pid ? 'PID ' + s.pid : 'PID —');
+      // Daemon pane
+      setText('daemonPid', s.pid || '—');
+      setText('daemonUptime', formatUptime(uptimeMs));
+      setText('daemonBridgeUrl', s.bridgeUrl || ('http://localhost:${PORT}'));
+      var healthTag = $('daemonHealthTag');
+      if (healthTag) {
+        healthTag.classList.remove('good','warn','bad');
+        if (s.running) { healthTag.classList.add('good'); healthTag.textContent = 'HEALTHY'; }
+        else { healthTag.classList.add('bad'); healthTag.textContent = 'OFFLINE'; }
+      }
+      // Rail foot
+      setText('footDaemonUptime', formatUptime(uptimeMs));
+      var fdLed = $('footDaemonLed'); if (fdLed){ fdLed.classList.remove('warn','bad'); if (!s.running) fdLed.classList.add('bad'); }
+      // MCP cell (we treat MCP as ready if daemon is running; calls counted from /api/actions)
+      setText('teleMcpVal', s.running ? 'READY' : 'OFFLINE');
+      var mled = $('teleMcpLed'); if (mled){ mled.classList.remove('warn','bad'); if (!s.running) mled.classList.add('bad'); }
+      // Relay
+      var rConn = !!(rs.relay && rs.relay.connected);
+      var rPaired = !!rs.hasAuth;
+      var rRejected = !!(rs.relay && rs.relay.authRejected);
+      var rNeedAuth = rPaired && rRejected;
+      var who = (rs.authUser && rs.authUser.email) || '';
+      var relayLabel = rPaired ? (rNeedAuth ? 'SIGN IN NEEDED' : (rConn ? 'CONNECTED' : 'PAIRED')) : 'UNPAIRED';
+      setText('teleRelayVal', relayLabel);
+      setText('teleRelaySub', rPaired ? (rNeedAuth ? ((who || 'stored bridge account') + ' - sign in again') : (who + (rConn ? '' : ' · awaiting'))) : 'no empir3 account on this PC');
+      var rled = $('teleRelayLed'); if (rled){ rled.classList.remove('warn','bad'); if (rNeedAuth) rled.classList.add('bad'); else if (!rPaired) rled.classList.add('warn'); }
+      var frled = $('footRelayLed'); if (frled){ frled.classList.remove('warn','bad'); if (rNeedAuth) frled.classList.add('bad'); else if (!rPaired) frled.classList.add('warn'); }
+      setText('footRelayState', rNeedAuth ? 'sign in needed' : (rPaired ? (who.split('@')[0] || 'paired') : 'unpaired'));
+      var ovRelayStatus = $('ovRelayStatus');
+      if (ovRelayStatus) {
+        ovRelayStatus.textContent = relayLabel;
+        ovRelayStatus.classList.remove('good','warn','bad');
+        ovRelayStatus.classList.add(rNeedAuth ? 'bad' : (rPaired ? 'good' : 'warn'));
+      }
+      // Account chip + pane
+      if (rPaired && who) {
+        setText('acctEmail', who);
+        var initials = (who.split('@')[0] || '').slice(0,2).toUpperCase();
+        setText('acctAvatar', initials || '··');
+        setText('acctPaneEmail', who);
+        setText('acctPaneServer', (rs.serverUrl || '').replace(/^https?:\\/\\//,''));
+        setText('acctPaneMode', rs.mode + (rNeedAuth ? ' · sign in needed' : (rConn ? ' · connected' : ' · awaiting relay')));
+        setText('acctPaneDevice', (rs.relay && rs.relay.deviceName) || '—');
+        var acctTag = $('acctConnTag');
+        if (acctTag) {
+          acctTag.className = 'tag ' + (rNeedAuth ? 'bad' : (rConn ? 'good' : 'warn'));
+          acctTag.textContent = rNeedAuth ? 'SIGN IN NEEDED' : (rConn ? 'CONNECTED' : 'PAIRED');
+        }
+        if (rNeedAuth) setStatus('acctStatus', 'Empir3 rejected the stored bridge token. Sign in again to pair this PC.', 'err');
+        else setStatus('acctStatus', '', 'info');
+        setText('ovRelayUser', who);
+        setText('ovRelayServer', (rs.serverUrl || '').replace(/^https?:\\/\\//,''));
+        document.body.dataset.view = 'signedin';
+      } else {
+        document.body.dataset.view = 'signedout';
+      }
+    } catch (e) {
+      // Daemon unreachable
+      setText('teleDaemonVal','OFFLINE');
+      var dled2 = $('teleDaemonLed'); if (dled2){ dled2.classList.add('bad'); }
+      setText('dtBridgeStatus','Disconnected');
+      setMetricTone('dtBridgeStatus','bad');
+      var dtTag2 = $('dtBridgeTag'); if (dtTag2) { dtTag2.textContent = 'OFFLINE'; dtTag2.className = 'tag bad'; }
+    }
+  }
+  async function refreshActions() {
+    try {
+      var rows = await getJson('/api/actions');
+      if (!Array.isArray(rows)) return;
+      var calls = rows.length, errs = rows.filter(function(r){ return r.ok === false; }).length;
+      setText('ovMcpCalls', calls + ' '); // suffix kept by overview HTML structure
+      var ovCalls = $('ovMcpCalls');
+      if (ovCalls) ovCalls.innerHTML = calls + ' <span style="color:var(--soft); font-size:14px;">/ ' + errs + ' err</span>';
+      setText('teleMcpSub', 'stdio · ' + calls + ' calls / ' + errs + ' errors');
+      setText('footMcpCount', calls + ' calls');
+      // Overview recent activity (top 5)
+      var ovRows = $('ovLogRows');
+      if (ovRows) {
+        if (!rows.length) ovRows.innerHTML = '<tr><td class="dt" style="text-align:center;">No activity yet.</td></tr>';
+        else ovRows.innerHTML = rows.slice(-5).reverse().map(rowHtml).join('');
+        var last = rows[rows.length-1];
+        if (last) setText('ovMcpLast', 'Last call ' + last.type + ' · ' + timeAgo(last.timestamp));
+      }
+      // Full log pane
+      var logsRows = $('logsRows');
+      if (logsRows) {
+        if (!rows.length) logsRows.innerHTML = '<tr><td class="dt" style="text-align:center;">No activity yet.</td></tr>';
+        else logsRows.innerHTML = rows.slice().reverse().map(rowHtml).join('');
+      }
+    } catch (e) {}
+  }
+  function rowHtml(r) {
+    var t = (r.timestamp || '').slice(11,19);
+    var ok = r.ok !== false;
+    var status = ok ? '200' : 'err';
+    var stClass = ok ? 'st' : 'st err';
+    var ms = (r.elapsedMs || 0) + ' ms';
+    var detail = r.error ? r.error : summarizeReceiptInput(r);
+    return '<tr><td class="ts mono">' + escapeHtml(t) + '</td><td class="nm">' + escapeHtml(r.type || '') + '</td><td class="' + stClass + '">' + status + '</td><td class="ms mono">' + escapeHtml(ms) + '</td><td class="dt">' + escapeHtml(detail) + '</td></tr>';
+  }
+  function summarizeReceiptInput(r) {
+    var i = r.input || {};
+    // Pick the field most useful per tool family. summarizeCommand() in
+    // server.ts copies through these keys verbatim, so they're stable.
+    if (i.url) return String(i.url);
+    if (i.ref) return 'ref:' + i.ref;
+    if (i.selector) return i.selector;
+    if (typeof i.x === 'number' && typeof i.y === 'number') return '(' + i.x + ',' + i.y + ')';
+    if (i.monitor) return 'monitor:' + i.monitor;
+    if (i.recording) return 'rec:' + i.recording;
+    if (i.filter) return 'filter:' + i.filter;
+    if (typeof i.textLength === 'number') return 'text·' + i.textLength + 'ch';
+    if (typeof i.messageLength === 'number') return 'msg·' + i.messageLength + 'ch';
+    if (i.format) return 'fmt:' + i.format;
+    return r.source || '';
+  }
+  async function refreshFocus() {
+    try {
+      var j = await getJson('/api/desktop/focus');
+      var has = !!j.active;
+      var tag = $('focusTag'); if (tag) { tag.textContent = has ? 'LOCKED' : 'NONE LOCKED'; tag.className = 'tag ' + (has ? 'good' : ''); }
+      setText('focusStatusText', has ? 'Region locked — agent scoped to it.' : 'No region — agent sees full virtual screen');
+      setText('focusTtl', has && j.ttlMs ? Math.round(j.ttlMs/1000) + 's' : '—');
+      setText('focusBounds', has && j.region ? (j.region.width + '×' + j.region.height + ' @ (' + j.region.x + ',' + j.region.y + ')') : '—');
+      var rel = $('agtReleaseFocus'); if (rel) rel.disabled = !has;
+      var grid = $('agtFocusGrid'); if (grid) grid.disabled = !has;
+      // Sync the focus-grid button label with the daemon's authoritative
+      // state. Without this the boot label always reads "Show focus grid"
+      // even when another channel (CLI, second tab) already toggled it on.
+      var serverGrid = !!(j.grid && j.grid.enabled);
+      if (serverGrid !== focusGridOn) {
+        focusGridOn = serverGrid;
+        if (grid) grid.textContent = focusGridOn ? 'Hide focus grid' : 'Show focus grid';
+      }
+      var aled = $('teleAgentLed'); if (aled){ aled.classList.remove('warn','bad','idle'); if (has) aled.classList.remove('idle'); else aled.classList.add('idle'); }
+      setText('teleAgentVal', has ? 'FOCUSED' : 'IDLE');
+      setText('teleAgentSub', has ? (j.region.width + '×' + j.region.height + ' locked') : 'no focus region');
+    } catch (e) {}
+  }
+
+  // ────── MCP config ──────
+  var mcpText = '';
+  $('mcpShowConfig').addEventListener('click', async function(){
+    setStatus('mcpStatus', 'Generating MCP config…', 'info');
+    try {
+      var j = await postJson('/api/install/claude-code', {});
+      mcpText = JSON.stringify(j.snippet, null, 2);
+      $('mcpSnippet').textContent = mcpText;
+      if (Array.isArray(j.instructions)) {
+        $('mcpSteps').innerHTML = j.instructions.map(function(s){ return '<li>' + escapeHtml(s) + '</li>'; }).join('');
+      }
+      setStatus('mcpStatus', 'MCP config ready.', 'ok');
+    } catch (e) { setStatus('mcpStatus', 'Could not generate config: ' + e.message, 'err'); }
+  });
+  $('mcpCopyConfig').addEventListener('click', async function(){
+    if (!mcpText) mcpText = $('mcpSnippet').textContent;
+    try { await navigator.clipboard.writeText(mcpText); setStatus('mcpStatus','Copied.','ok'); }
+    catch (e) {
+      // navigator.clipboard.writeText rejects in headless contexts and any
+      // browser tab without focus. Pre-select the snippet so ⌘C / Ctrl+C
+      // grabs it without the user having to click into the <pre> manually.
+      try {
+        var pre = $('mcpSnippet');
+        var range = document.createRange();
+        range.selectNodeContents(pre);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        setStatus('mcpStatus','Snippet selected — press \u2318C / Ctrl+C to copy.','info');
+      } catch (_e) {
+        setStatus('mcpStatus','Select the snippet and copy manually.','err');
+      }
+    }
+  });
+
+  // ────── Daemon pane ──────
+  async function onOpenBridge() {
+    try { await postJson('/api/command', { action:'desktop:browse:show', params:{} }); setStatus('daemonStatus','Bridge window requested.','ok'); }
+    catch (e) { setStatus('daemonStatus','Could not open: ' + e.message,'err'); }
+  }
+  $('daemonOpenBridge').addEventListener('click', onOpenBridge);
+  $('ovOpenBridge').addEventListener('click', onOpenBridge);
+  async function onReconnect() {
+    setStatus('daemonStatus','Reconnecting daemon… tray will respawn it.','info');
+    try { await fetch(API + '/api/shutdown', { method:'POST' }); setTimeout(refreshStatus, 2500); }
+    catch (e) { setStatus('daemonStatus','Reconnect failed: ' + e.message,'err'); }
+  }
+  $('daemonReconnect').addEventListener('click', onReconnect);
+  $('ovReconnect').addEventListener('click', onReconnect);
+  $('daemonToggleLog').addEventListener('click', async function(){
+    var pane = $('daemonLog');
+    if (pane.style.display === 'none') {
+      try {
+        var j = await getJson('/api/log/tail?lines=200');
+        var lines = (j.lines || []).filter(function(l){ return l && l.trim(); });
+        pane.textContent = lines.length ? lines.join('\\n') : '(no log lines yet — ' + (j.path || 'bridge.log') + ')';
+        pane.style.display = 'block';
+        $('daemonToggleLog').textContent = 'Hide log';
+      } catch (e) {
+        pane.textContent = 'Could not load log: ' + e.message;
+        pane.style.display = 'block';
+        $('daemonToggleLog').textContent = 'Hide log';
+      }
+    } else {
+      pane.style.display = 'none';
+      $('daemonToggleLog').textContent = 'Show log';
+    }
+  });
+
+  // ────── Identity (Device name + Home directory) ──────
+  // Mirrors the old /settings page fields that didn't make it into the
+  // welcome console rewrite. Both live in bridge-settings.json and feed
+  // empir3-agent labelling + the project-sync scope.
+  function hydrateIdentity() {
+    if (!CLI_STATE || !CLI_STATE.bridge) return;
+    var dn = $('deviceNameInput'); if (dn && !dn.matches(':focus')) dn.value = CLI_STATE.bridge.deviceName || '';
+    var hd = $('homeDirInput'); if (hd && !hd.matches(':focus')) hd.value = CLI_STATE.bridge.homeDirectory || '';
+    setText('identityTag', CLI_STATE.bridge.deviceName || 'unnamed');
+  }
+  var identitySave = $('identitySave');
+  if (identitySave) {
+    identitySave.addEventListener('click', async function(){
+      var dn = ($('deviceNameInput').value || '').trim();
+      var hd = ($('homeDirInput').value || '').trim();
+      if (!dn && !hd) { setStatus('identityStatus','Nothing to save.','info'); return; }
+      var patch = {};
+      if (dn) patch.deviceName = dn;
+      if (hd) patch.homeDirectory = hd;
+      setStatus('identityStatus','Saving identity…','info');
+      markLocalMutate();
+      try {
+        await postJson('/api/settings/state', { bridge: patch });
+        setStatus('identityStatus','Saved.','ok');
+        await loadCliState();
+      } catch (e) {
+        setStatus('identityStatus','Failed: ' + e.message,'err');
+      }
+    });
+  }
+  var identityReset = $('identityReset');
+  if (identityReset) {
+    identityReset.addEventListener('click', function(){
+      if (CLI_STATE && CLI_STATE.bridge) {
+        $('deviceNameInput').value = CLI_STATE.bridge.deviceName || '';
+        $('homeDirInput').value = CLI_STATE.bridge.homeDirectory || '';
+        setStatus('identityStatus','Reset to saved values.','info');
+      }
+    });
+  }
+
+  // ────── Desktop tools pane ──────
+  function showDesktopOutput(label, value) {
+    var out = $('dtCommandOutput');
+    if (!out) return;
+    out.style.display = 'block';
+    var text = typeof value === 'string' ? value : JSON.stringify(value, function(k, v) {
+      if (typeof v === 'string' && v.length > 1200) return v.slice(0, 1200) + '…';
+      return v;
+    }, 2);
+    out.textContent = label + '\\n' + text;
+  }
+  async function runDesktopCommand(label, cmd, options) {
+    options = options || {};
+    setStatus('desktopToolsStatus', label + '…', 'info');
+    try {
+      var j = await postJson('/api/command', cmd);
+      var result = j && (j.result || j);
+      if (options.show !== false) showDesktopOutput(label, result);
+      setStatus('desktopToolsStatus', options.done || (label + ' complete.'), 'ok');
+      refreshStatus();
+      refreshActions();
+      return result;
+    } catch (e) {
+      setStatus('desktopToolsStatus', label + ' failed: ' + e.message, 'err');
+      throw e;
+    }
+  }
+  $('dtOpenDesktopTest').addEventListener('click', function(){
+    runDesktopCommand('Opening desktop test', { type:'navigate', url: location.origin + '/desktop-test' }, { show:false, done:'Desktop test opened.' });
+  });
+  $('dtBrowserScreenshot').addEventListener('click', function(){
+    runDesktopCommand('Browser screenshot', { type:'screenshot' });
+  });
+  $('dtBrowserRefresh').addEventListener('click', function(){
+    runDesktopCommand('Browser refresh', { type:'refresh' }, { show:false, done:'Refresh sent.' });
+  });
+  $('dtBrowserSnapshot').addEventListener('click', function(){
+    runDesktopCommand('Interactive snapshot', { type:'snapshot', filter:'interactive', format:'compact' });
+  });
+  $('dtInjectOverlay').addEventListener('click', async function(){
+    setStatus('desktopToolsStatus','Injecting overlay…','info');
+    try {
+      var script = await (await fetch('/overlay.js')).text();
+      await runDesktopCommand('Inject overlay', { type:'evaluate', script: script }, { show:false, done:'Overlay injected.' });
+    } catch (e) {
+      setStatus('desktopToolsStatus','Inject overlay failed: ' + e.message,'err');
+    }
+  });
+  $('dtRevokeControl').addEventListener('click', async function(){
+    if (!confirm('Disable browser interact, desktop, eval, and recording tools?')) return;
+    setStatus('desktopToolsStatus','Revoking write control…','info');
+    try {
+      var r = await fetch(API + '/api/safety/lockdown', { method:'POST' });
+      if (!r.ok) throw new Error(await r.text());
+      await loadPermissionState();
+      await refreshStatus();
+      setStatus('desktopToolsStatus','Write control revoked.','ok');
+    } catch (e) {
+      setStatus('desktopToolsStatus','Revoke failed: ' + e.message,'err');
+    }
+  });
+
+  $('agtSelectRegion').addEventListener('click', async function(){
+    setStatus('agentStatus','Drag a region on screen — bridge waits up to 2 minutes.','info');
+    try {
+      var j = await postJson('/api/command', { type:'desktop_select_region', timeoutMs:120000 });
+      var region = j && j.result && j.result.region;
+      if (region) setStatus('agentStatus','Region set: ' + region.width + '×' + region.height + ' at (' + region.x + ',' + region.y + ').','ok');
+      else if (j && j.result && j.result.cancelled) setStatus('agentStatus','Region selection cancelled.','info');
+      else setStatus('agentStatus','Region selection finished.','ok');
+      refreshFocus();
+    } catch (e) { setStatus('agentStatus','Select region failed: ' + e.message,'err'); }
+  });
+  $('agtReleaseFocus').addEventListener('click', async function(){
+    setStatus('agentStatus','Releasing focus…','info');
+    try { await postJson('/api/command', { type:'desktop_release_focus' }); setStatus('agentStatus','Agent focus released.','ok'); refreshFocus(); }
+    catch (e) { setStatus('agentStatus','Release failed: ' + e.message,'err'); }
+  });
+  var focusGridOn = false;
+  $('agtFocusGrid').addEventListener('click', async function(){
+    try {
+      var want = !focusGridOn;
+      var j = await postJson('/api/command', { type:'desktop_focus_grid', action: want ? 'show' : 'hide' });
+      focusGridOn = !!(j && j.result && j.result.enabled);
+      $('agtFocusGrid').textContent = focusGridOn ? 'Hide focus grid' : 'Show focus grid';
+      setStatus('agentStatus','Focus grid ' + (focusGridOn ? 'visible.' : 'hidden.'),'ok');
+    } catch (e) { setStatus('agentStatus','Focus grid toggle failed: ' + e.message,'err'); }
+  });
+  $('agtCalibrate').addEventListener('click', async function(){
+    setStatus('calStatus','Calibration started — click the ghost cursor when it appears (60s).','info');
+    try {
+      var j = await postJson('/api/command', { type:'desktop_calibrate_pointer' });
+      if (j && j.result && j.result.cancelled) { setStatus('calStatus','Calibration cancelled.','info'); return; }
+      var cal = j && j.result && j.result.calibration;
+      if (cal) {
+        var dx = cal.offsetX|0, dy = cal.offsetY|0;
+        setText('calOffsetX', (dx>=0?'+':'') + dx + ' px');
+        setText('calOffsetY', (dy>=0?'+':'') + dy + ' px');
+        setText('calLastRun', new Date().toISOString().slice(0,16).replace('T',' '));
+        var tag = $('calibrationTag'); if (tag){ tag.textContent = 'CALIBRATED'; tag.className = 'tag good'; }
+        setStatus('calStatus','Saved.','ok');
+      }
+    } catch (e) { setStatus('calStatus','Calibration failed: ' + e.message,'err'); }
+  });
+
+  // ────── Updates pane ──────
+  $('updateCheck').addEventListener('click', async function(){
+    setStatus('updateStatus','Checking for updates…','info');
+    try {
+      var j = await getJson('/api/updates/check');
+      var local = j.local || '${BRIDGE_VERSION}';
+      var remote = j.remote || '(unknown)';
+      setText('updateAvailable', remote);
+      setText('updateLastCheck', new Date().toLocaleTimeString());
+      var tag = $('updateTag'); if (tag){ tag.textContent = j.newer ? 'UPDATE AVAILABLE' : 'CURRENT'; tag.className = 'tag ' + (j.newer ? 'warn' : 'good'); }
+      if (j.newer) { $('updateApply').style.display = 'inline-flex'; setStatus('updateStatus','Update available: v' + remote + ' (you are on v' + local + ').','ok'); }
+      else { $('updateApply').style.display = 'none'; setStatus('updateStatus','You are on the latest version.','ok'); }
+    } catch (e) { setStatus('updateStatus','Update check failed: ' + e.message,'err'); }
+  });
+  $('updateApply').addEventListener('click', async function(){
+    if (!confirm('Apply update? The tray and bridge daemon will restart.')) return;
+    setStatus('updateStatus','Queuing update…','info');
+    try { await postJson('/api/tray/enqueue', { type:'tray_apply_update' }); setStatus('updateStatus','Update queued — tray will restart shortly.','ok'); }
+    catch (e) { setStatus('updateStatus','Could not queue update: ' + e.message,'err'); }
+  });
+  $('autoUpdateToggle').addEventListener('change', async function(e){
+    setStatus('policyStatus','Saving…','info');
+    try { var r = await postJson('/api/settings/state', { bridge: { autoUpdate: !!e.target.checked } }); setStatus('policyStatus','Auto-update ' + ((r && r.bridge && r.bridge.autoUpdate !== false) ? 'on' : 'off') + '.','ok'); }
+    catch (e2) { setStatus('policyStatus','Could not save: ' + e2.message,'err'); }
+  });
+
+  // ────── Lifecycle pane ──────
+  async function enqueueTray(type, confirmMsg) {
+    if (confirmMsg && !confirm(confirmMsg)) return;
+    setStatus('lifeStatus','Queuing ' + type + '…','info');
+    try { await postJson('/api/tray/enqueue', { type: type }); setStatus('lifeStatus',type + ' queued.','ok'); }
+    catch (e) { setStatus('lifeStatus','Failed: ' + e.message,'err'); }
+  }
+  $('lifeRestart').addEventListener('click', function(){ enqueueTray('tray_restart_tray','Restart the Empir3 tray? The bridge daemon will restart with it.'); });
+  $('lifeQuit').addEventListener('click',    function(){ enqueueTray('tray_quit','Quit Empir3? The tray icon will disappear and the bridge daemon will stop.'); });
+  $('lifeUninstall').addEventListener('click', function(){ enqueueTray('tray_uninstall','Uninstall Empir3?\\n\\nThis wipes the bridge Chrome profile, auth, settings, autostart entry, Start Menu shortcut, and cached payloads. Irreversible.'); });
+
+  // ────── Account / sign-in drawer ──────
+  function syncServerUi(serverUrl) {
+    var norm = (serverUrl || PROD_SERVER).replace(/\\/+$/,'');
+    if (norm === PROD_SERVER) $('serverPreset').value = 'production';
+    else if (norm === DEV_SERVER) $('serverPreset').value = 'local-dev';
+    else $('serverPreset').value = 'custom';
+    if ($('serverUrl')) $('serverUrl').value = norm;
+    $('customServerLabel').style.display = $('serverPreset').value === 'custom' ? 'grid' : 'none';
+  }
+  function selectedServer() {
+    var p = $('serverPreset').value;
+    if (p === 'production') return PROD_SERVER;
+    if (p === 'local-dev') return DEV_SERVER;
+    return ($('serverUrl').value || PROD_SERVER).trim();
+  }
+  $('serverPreset').addEventListener('change', function(){
+    var p = $('serverPreset').value;
+    if (p === 'production') $('serverUrl').value = PROD_SERVER;
+    else if (p === 'local-dev') $('serverUrl').value = DEV_SERVER;
+    $('customServerLabel').style.display = p === 'custom' ? 'grid' : 'none';
+  });
+  $('pairEmpir3').addEventListener('click', async function(){
+    setStatus('drawerStatus','Starting browser-based empir3 pairing…','info');
+    try {
+      var j = await postJson('/api/install/empir3-pair', { serverUrl: selectedServer() });
+      if (!j.ok || !j.redirectUrl) throw new Error(j.error || 'pairing failed');
+      setStatus('drawerStatus','Opening empir3…','ok');
+      setTimeout(function(){ location.href = j.redirectUrl; }, 400);
+    } catch (e) { setStatus('drawerStatus','Could not start pairing: ' + e.message,'err'); }
+  });
+  $('loginForm').addEventListener('submit', async function(e){
+    e.preventDefault();
+    setStatus('drawerStatus','Signing in…','info');
+    try {
+      var j = await postJson('/api/install/empir3-login', { email: $('loginEmail').value, password: $('loginPassword').value, serverUrl: selectedServer() });
+      if (!j.ok) throw new Error(j.error || 'login failed');
+      setStatus('drawerStatus','Signed in. Reloading…','ok');
+      setTimeout(function(){ location.reload(); }, 700);
+    } catch (e2) { setStatus('drawerStatus','Could not sign in: ' + e2.message,'err'); }
+  });
+  $('acctSignOut').addEventListener('click', async function(){
+    if (!confirm('Sign out the stored empir3 account from this bridge?')) return;
+    setStatus('acctStatus','Signing out…','info');
+    try { var j = await postJson('/api/install/sign-out', {}); if (!j.ok) throw new Error(j.error||'sign out failed'); setStatus('acctStatus','Signed out. Reloading…','ok'); setTimeout(function(){ location.reload(); }, 600); }
+    catch (e) { setStatus('acctStatus','Could not sign out: ' + e.message,'err'); }
+  });
+
+  // ────── Drawer + nav + theme ──────
+  var drawer = $('drawer'), backdrop = $('backdrop');
+  window.openDrawer = function(){ drawer.classList.add('open'); backdrop.classList.add('open'); };
+  window.closeDrawer = function(){ drawer.classList.remove('open'); backdrop.classList.remove('open'); };
+  $('openSignIn').addEventListener('click', openDrawer);
+  $('openAccount').addEventListener('click', function(){ goto('account'); });
+  backdrop.addEventListener('click', closeDrawer);
+
+  var PANE_LABELS = { overview:'Overview', permissions:'Permissions', mcp:'MCP Connection', clis:'API & CLIs', agent:'Desktop Tools', account:'empir3 Account', daemon:'Daemon', updates:'Updates', logs:'Activity Log', lifecycle:'Tray Lifecycle' };
+  function closeRail() { document.body.classList.remove('rail-open'); }
+  function goto(name) {
+    document.querySelectorAll('.rail-nav a').forEach(function(a){ a.classList.toggle('active', a.dataset.nav === name); });
+    document.querySelectorAll('.pane').forEach(function(p){ p.classList.toggle('active', p.dataset.pane === name); });
+    setText('crumbHere', PANE_LABELS[name] || name);
+    document.querySelector('.pane-scroll').scrollTop = 0;
+    if (name === 'logs') refreshActions();
+    closeRail();
+  }
+  document.querySelectorAll('[data-nav]').forEach(function(a){ a.addEventListener('click', function(e){ e.preventDefault(); goto(a.dataset.nav); }); });
+  document.querySelectorAll('[data-goto]').forEach(function(b){ b.addEventListener('click', function(e){ e.preventDefault(); goto(b.dataset.goto); }); });
+  var railToggleBtn = $('railToggle');
+  if (railToggleBtn) railToggleBtn.addEventListener('click', function(){ document.body.classList.toggle('rail-open'); });
+  var railScrim = $('railScrim');
+  if (railScrim) railScrim.addEventListener('click', closeRail);
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape' && document.body.classList.contains('rail-open')) closeRail(); });
+
+  // Theme persistence
+  try { var th = localStorage.getItem('empir3-bridge-theme'); if (th === 'dark' || th === 'light') document.body.dataset.theme = th; } catch (_) {}
+  $('themeToggle').addEventListener('click', function(){
+    var next = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.body.dataset.theme = next;
+    try { localStorage.setItem('empir3-bridge-theme', next); } catch (_) {}
+  });
+
+  // Logs refresh button
+  $('logsRefresh').addEventListener('click', refreshActions);
+
+  // ────── Calibration initial load (real fetch on boot) ──────
+  async function refreshCalibration() {
+    try {
+      var j = await postJson('/api/command', { type: 'desktop_calibration_status' });
+      var cal = j && j.result && (j.result.calibration || j.result);
+      var hasCal = cal && (cal.offsetX != null || cal.offsetY != null);
+      var tag = $('calibrationTag');
+      if (hasCal) {
+        var dx = cal.offsetX|0, dy = cal.offsetY|0;
+        setText('calOffsetX', (dx>=0?'+':'') + dx + ' px');
+        setText('calOffsetY', (dy>=0?'+':'') + dy + ' px');
+        if (cal.updatedAt) setText('calLastRun', String(cal.updatedAt).slice(0,16).replace('T',' '));
+        if (tag) { tag.textContent = 'CALIBRATED'; tag.className = 'tag good'; }
+      } else {
+        setText('calOffsetX', '—'); setText('calOffsetY', '—'); setText('calLastRun', '—');
+        if (tag) { tag.textContent = 'UNCALIBRATED'; tag.className = 'tag'; }
+      }
+    } catch (_) { /* read-only call; ignore if denied */ }
+  }
+
+  // ────── API & CLIs pane ──────
+  // The row schema is single-source-of-truth — adding a provider here +
+  // its probe in buildSettingsState() is the whole front-end change.
+  // The 'lendable' flag controls whether the row gets a "Lend to empir3"
+  // toggle vs the higgsfield handler-family toggle.
+  var CLI_ROWS = [
+    { id:'claude',     label:'Claude Code',      vendor:'Anthropic', lendable:true, settingsKey:'lendClaudeMax',     keyField:'apiKeyAnthropic', keyVendor:'anthropic' },
+    { id:'codex',      label:'OpenAI Codex',     vendor:'OpenAI',    lendable:true, settingsKey:'lendOpenAiCodex',   keyField:'apiKeyOpenai',    keyVendor:'openai' },
+    { id:'gemini',     label:'Gemini CLI',       vendor:'Google',    lendable:true, settingsKey:'lendGoogleGemini',  keyField:'apiKeyGoogle',    keyVendor:'google' },
+    { id:'grok',       label:'Grok Build CLI',   vendor:'xAI',       lendable:true, settingsKey:'lendXaiGrok',       keyField:'apiKeyXai',       keyVendor:'xai' },
+    { id:'higgsfield', label:'Higgsfield CLI',   vendor:'Higgsfield',lendable:false, handlerKey:'higgsfield' },
+    { id:'github',     label:'GitHub CLI',       vendor:'GitHub',    lendable:true, settingsKey:'lendGitHubCli', ghScopes:true },
+  ];
+  // GitHub CLI lend scopes — fine-grained per-capability gates shown under
+  // the GitHub row when the master lend is on. Mirrors the backend
+  // defaultGhScopes() baseline. label/hint are UI-only.
+  var GH_SCOPE_DEFS = [
+    { key:'read',      label:'Read',      hint:'list / view / status / search / api GET' },
+    { key:'pr',        label:'Pull requests', hint:'create / edit / merge / review / comment' },
+    { key:'issue',     label:'Issues',    hint:'create / edit / close / comment' },
+    { key:'repo',      label:'Repos',     hint:'create / edit / fork / rename (not delete)' },
+    { key:'release',   label:'Releases',  hint:'create / edit / upload / download' },
+    { key:'workflow',  label:'Workflows', hint:'run / cancel / rerun — spends CI' },
+    { key:'admin',     label:'Admin',     hint:'secrets, repo delete, org, SSH/GPG keys' },
+    { key:'api_write', label:'Raw API write', hint:'gh api with POST / PATCH / DELETE' },
+  ];
+  var CLI_STATE = null; // last full settings-state response
+
+  function renderCliRows() {
+    var tbody = $('cliRows'); if (!tbody) return;
+    if (!CLI_STATE) { tbody.innerHTML = '<tr><td colspan="5" class="dt" style="text-align:center; color:var(--soft);">Loading…</td></tr>'; return; }
+    var providers = (CLI_STATE.providers || {});
+    var bridge = (CLI_STATE.bridge || {});
+    var handlers = bridge.handlers || {};
+    var installedCount = 0;
+    var html = '';
+    for (var i = 0; i < CLI_ROWS.length; i++) {
+      var row = CLI_ROWS[i];
+      var p = providers[row.id] || {};
+      var installed = !!p.available;
+      if (installed) installedCount++;
+      var authed = !!p.authenticated;
+      var installTag = installed
+        ? '<span class="tag good">' + escapeHtml(p.version || 'installed') + '</span>'
+        : '<span class="tag bad">NOT INSTALLED</span>';
+      var authTag = installed
+        ? (authed
+          ? '<span class="tag good">AUTHED' + (p.auth_via && p.auth_via !== 'creds_file' && p.auth_via !== 'auth_file' ? ' · ' + escapeHtml(String(p.auth_via).toUpperCase()) : '') + '</span>'
+          : '<span class="tag warn">NEEDS AUTH</span>')
+        : '<span class="tag" style="color:var(--soft);">—</span>';
+      var toggleCell;
+      if (row.lendable) {
+        var checked = !!bridge[row.settingsKey];
+        toggleCell = '<label class="sw"><input type="checkbox" data-cli-toggle="' + row.id + '" data-settings-key="' + row.settingsKey + '"' + (checked?' checked':'') + (installed?'':' disabled') + '><span class="s"></span></label> <span style="font-size:11.5px; color:var(--soft); margin-left:6px;">' + (installed ? (checked ? 'lending' : 'not lent') : 'install first') + '</span>';
+      } else if (row.handlerKey) {
+        var hEnabled = !!(handlers[row.handlerKey] && handlers[row.handlerKey].enabled);
+        // Count per-tool toggles for this family on the Permissions page —
+        // gives users a "3 / 3 tools on" readout so they can see the family
+        // gate and per-tool layers stay in sync.
+        var familyTools = (typeof TOOLS !== 'undefined' && TOOLS) ? TOOLS.filter(function(t){ return t.g === row.handlerKey; }) : [];
+        var familyOn = familyTools.filter(function(t){ return t.on; }).length;
+        var summary;
+        if (!hEnabled) {
+          summary = 'tools disabled <span style="opacity:0.7;">(' + familyOn + '/' + familyTools.length + ' configured)</span>';
+        } else {
+          summary = familyOn + ' / ' + familyTools.length + ' tools · <a href="#" data-goto="permissions" data-perm-filter="' + row.handlerKey + '" style="color:var(--accent); text-decoration:underline;">configure</a>';
+        }
+        toggleCell = '<label class="sw"><input type="checkbox" data-cli-toggle="' + row.id + '" data-handler-key="' + row.handlerKey + '"' + (hEnabled?' checked':'') + '><span class="s"></span></label> <span style="font-size:11.5px; color:var(--soft); margin-left:6px;">' + summary + '</span>';
+      } else {
+        toggleCell = '<span style="color:var(--soft);">—</span>';
+      }
+      var authBtn = installed
+        ? '<button class="btn small" type="button" data-cli-auth="' + row.id + '">' + (authed ? 'Re-auth' : 'Authenticate') + '</button>'
+        : '<span style="font-size:11.5px; color:var(--soft);">install first</span>';
+      html += '<tr>' +
+        '<td class="col-nm"><div style="font-weight:600;">' + escapeHtml(row.label) + '</div><div style="font-size:11.5px; color:var(--soft);">' + escapeHtml(row.vendor) + (p.path ? ' · ' + escapeHtml(shortPath(p.path)) : '') + '</div></td>' +
+        '<td>' + installTag + '</td>' +
+        '<td>' + authTag + '</td>' +
+        '<td>' + toggleCell + '</td>' +
+        '<td>' + authBtn + '</td>' +
+        '</tr>';
+      // GitHub CLI: when the master lend is on, render the fine-grained
+      // scope matrix as a full-width sub-row directly beneath it.
+      if (row.ghScopes && !!bridge.lendGitHubCli) {
+        var sc = bridge.githubScopes || {};
+        var acct = (p.account ? ' · acting as <b>' + escapeHtml(p.account) + '</b>' : '');
+        var cells = '';
+        for (var gi = 0; gi < GH_SCOPE_DEFS.length; gi++) {
+          var sd = GH_SCOPE_DEFS[gi];
+          var on = !!sc[sd.key];
+          cells += '<label class="gh-scope" title="' + escapeAttr(sd.hint) + '" style="display:flex; align-items:flex-start; gap:7px; padding:7px 9px; border:1px solid var(--line); border-radius:8px; background:var(--card2,rgba(255,255,255,0.02));">' +
+            '<input type="checkbox" data-gh-scope="' + sd.key + '"' + (on?' checked':'') + (installed?'':' disabled') + ' style="margin-top:2px;">' +
+            '<span><span style="font-weight:600; font-size:12.5px;">' + escapeHtml(sd.label) + '</span><br><span style="font-size:11px; color:var(--soft);">' + escapeHtml(sd.hint) + '</span></span>' +
+            '</label>';
+        }
+        html += '<tr class="gh-scope-row"><td colspan="5" style="padding:4px 14px 14px 14px;">' +
+          '<div style="font-size:11.5px; color:var(--soft); margin:0 0 8px 2px;">Scopes a remote / team agent may use with your GitHub login' + acct + '. Token exfil, de-auth, aliases &amp; extensions are always blocked.</div>' +
+          '<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:8px;">' + cells + '</div>' +
+          '</td></tr>';
+      }
+    }
+    // Append custom OpenAI-compatible providers (dynamic — added by the
+    // user via the "+ Add custom provider" modal). Renders as the same
+    // row shape so the table stays consistent. Action column gets a
+    // Remove button instead of Auth since custom providers don't have a
+    // CLI auth flow — they hold their API key (if any) inside the
+    // provider definition itself.
+    var customs = (CLI_STATE.customProviders || []);
+    for (var ci = 0; ci < customs.length; ci++) {
+      var cp = customs[ci];
+      var avail = !!cp.available;
+      if (avail) installedCount++;
+      var statusTag = avail
+        ? (cp.authError
+          ? '<span class="tag warn">AUTH ERROR</span>'
+          : '<span class="tag good">ONLINE</span>')
+        : '<span class="tag bad">OFFLINE</span>';
+      var keyTag = cp.apiKeySet
+        ? '<span class="tag good">KEY SET</span>'
+        : (avail ? '<span class="tag" style="color:var(--soft);">NO KEY</span>' : '<span class="tag" style="color:var(--soft);">—</span>');
+      var modelCount = (cp.models || []).length;
+      var modelInfo = modelCount > 0 ? modelCount + ' model' + (modelCount === 1 ? '' : 's') : (avail ? '0 models' : '—');
+      var lendCell = '<label class="sw"><input type="checkbox" data-custom-lend="' + escapeAttr(cp.slug) + '"' + (cp.lend?' checked':'') + (avail?'':' disabled') + '><span class="s"></span></label> <span style="font-size:11.5px; color:var(--soft); margin-left:6px;">' + (avail ? (cp.lend ? 'lending (v2)' : 'not lent') : 'offline') + '</span>';
+      html += '<tr>' +
+        '<td class="col-nm"><div style="font-weight:600;">' + escapeHtml(cp.name) + '</div><div style="font-size:11.5px; color:var(--soft);">custom · ' + escapeHtml(cp.slug) + ' · ' + escapeHtml(shortPath(cp.apiBaseUrl)) + '</div></td>' +
+        '<td>' + statusTag + ' <span style="font-size:11.5px; color:var(--soft); margin-left:4px;">' + escapeHtml(modelInfo) + '</span></td>' +
+        '<td>' + keyTag + '</td>' +
+        '<td>' + lendCell + '</td>' +
+        '<td><button class="btn small ghost" type="button" data-custom-remove="' + escapeAttr(cp.slug) + '">Remove</button></td>' +
+        '</tr>';
+    }
+    tbody.innerHTML = html;
+    setText('cliInstalledTag', installedCount + ' / ' + (CLI_ROWS.length + customs.length));
+    // API key indicators
+    var keysSet = (CLI_STATE.chat && CLI_STATE.chat.apiKeysSet) || {};
+    var setCount = ['anthropic','openai','google','xai'].filter(function(k){ return !!keysSet[k]; }).length;
+    setText('apiKeysTag', setCount + ' / 4 set');
+    // Wire toggle change handlers freshly each render
+    document.querySelectorAll('[data-cli-toggle]').forEach(function(cb){
+      cb.addEventListener('change', function(){ onCliToggleChange(cb); });
+    });
+    document.querySelectorAll('[data-gh-scope]').forEach(function(cb){
+      cb.addEventListener('change', function(){ onGhScopeChange(cb); });
+    });
+    document.querySelectorAll('[data-cli-auth]').forEach(function(btn){
+      btn.addEventListener('click', function(){ onCliAuthClick(btn.dataset.cliAuth); });
+    });
+    // Wire the "configure" link inside the cell summary — jump to
+    // Permissions and pre-select the matching family filter button.
+    document.querySelectorAll('#cliRows [data-perm-filter]').forEach(function(a){
+      a.addEventListener('click', function(e){
+        e.preventDefault();
+        var f = a.dataset.permFilter;
+        goto('permissions');
+        var btn = document.querySelector('.perm-toolbar .filter-group [data-filter="' + f + '"]');
+        if (btn) btn.click();
+      });
+    });
+    // Custom provider: Remove button.
+    document.querySelectorAll('#cliRows [data-custom-remove]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var slug = b.dataset.customRemove;
+        if (!confirm('Remove provider "' + slug + '"?')) return;
+        removeCustomProvider(slug);
+      });
+    });
+    // Custom provider: Lend toggle (v1 flips the local flag; empir3
+    // server-side routing is v2 and ignores this for now).
+    document.querySelectorAll('#cliRows [data-custom-lend]').forEach(function(cb){
+      cb.addEventListener('change', function(){
+        toggleCustomProviderLend(cb.dataset.customLend, cb.checked);
+      });
+    });
+  }
+
+  async function removeCustomProvider(slug) {
+    setStatus('cliStatus', 'Removing ' + slug + '…', 'info');
+    markLocalMutate();
+    try {
+      var r = await fetch(API + '/api/cli/providers/' + encodeURIComponent(slug), { method: 'DELETE' });
+      var j = await r.json();
+      if (!j.ok) throw new Error(j.error || 'remove failed');
+      setStatus('cliStatus', slug + ' removed.', 'ok');
+      await loadCliState();
+    } catch (e) {
+      setStatus('cliStatus', 'Remove failed: ' + e.message, 'err');
+    }
+  }
+
+  async function toggleCustomProviderLend(slug, lend) {
+    setStatus('cliStatus', 'Saving ' + slug + '…', 'info');
+    markLocalMutate();
+    try {
+      var r = await fetch(API + '/api/cli/providers/' + encodeURIComponent(slug) + '/lend', {
+        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ lend: lend })
+      });
+      var j = await r.json();
+      if (!j.ok) throw new Error(j.error || 'failed');
+      setStatus('cliStatus', slug + ' ' + (lend ? 'lend on' : 'lend off') + ' (empir3 routing is v2 — not active yet)', 'ok');
+      await loadCliState();
+    } catch (e) {
+      setStatus('cliStatus', 'Failed: ' + e.message, 'err');
+    }
+  }
+
+  function shortPath(p) {
+    if (!p) return '';
+    var s = String(p);
+    if (s.length <= 36) return s;
+    return '…' + s.slice(-33);
+  }
+
+  async function onCliToggleChange(cb) {
+    var id = cb.dataset.cliToggle;
+    var want = cb.checked;
+    setStatus('cliStatus', 'Saving ' + id + '…', 'info');
+    markLocalMutate();
+    try {
+      var patch;
+      if (cb.dataset.settingsKey) {
+        patch = {}; patch[cb.dataset.settingsKey] = want;
+        await postJson('/api/settings/state', { bridge: patch });
+      } else if (cb.dataset.handlerKey) {
+        var h = {}; h[cb.dataset.handlerKey] = { enabled: want };
+        await postJson('/api/settings/state', { bridge: { handlers: h } });
+      }
+      setStatus('cliStatus', id + ' ' + (want ? 'enabled.' : 'disabled.'), 'ok');
+      await loadCliState();
+    } catch (e) {
+      setStatus('cliStatus', 'Failed: ' + e.message, 'err');
+      await loadCliState();
+    }
+  }
+
+  async function onGhScopeChange(cb) {
+    var scope = cb.dataset.ghScope;
+    var want = cb.checked;
+    setStatus('cliStatus', 'Saving GitHub ' + scope + ' scope…', 'info');
+    markLocalMutate();
+    try {
+      var s = {}; s[scope] = want;
+      await postJson('/api/settings/state', { bridge: { githubScopes: s } });
+      setStatus('cliStatus', 'GitHub "' + scope + '" scope ' + (want ? 'enabled.' : 'disabled.'), 'ok');
+      await loadCliState();
+    } catch (e) {
+      setStatus('cliStatus', 'Failed: ' + e.message, 'err');
+      await loadCliState();
+    }
+  }
+
+  async function onCliAuthClick(id) {
+    setStatus('cliStatus', 'Launching ' + id + ' auth flow…', 'info');
+    try {
+      var j = await postJson('/api/cli/auth', { provider: id });
+      if (j && j.launched) {
+        setStatus('cliStatus', id + ' auth launched in a new window — finish in your browser, then click Refresh.', 'ok');
+      } else if (j && j.error) {
+        setStatus('cliStatus', 'Auth failed: ' + j.error, 'err');
+      }
+    } catch (e) {
+      setStatus('cliStatus', 'Auth call failed: ' + e.message, 'err');
+    }
+  }
+
+  async function loadCliState() {
+    try {
+      var s = await getJson('/api/settings/state');
+      CLI_STATE = s;
+      renderCliRows();
+      // Refresh permissions table too — the family-gate banner there is
+      // driven by CLI_STATE.bridge.handlers, so a tray/CLI-page toggle
+      // needs to re-render the per-tool group below it.
+      if (typeof renderTable === 'function') renderTable();
+      // Identity inputs on the Daemon pane mirror bridge-settings.json
+      if (typeof hydrateIdentity === 'function') hydrateIdentity();
+      // Hydrate API-key field placeholders to reflect "set" vs "empty".
+      var keysSet = (s.chat && s.chat.apiKeysSet) || {};
+      var k = $('apiKeyAnthropic'); if (k) k.placeholder = keysSet.anthropic ? '•••••• (saved — leave blank to keep)' : 'sk-ant-…';
+      var k2 = $('apiKeyOpenai'); if (k2) k2.placeholder = keysSet.openai ? '•••••• (saved — leave blank to keep)' : 'sk-…';
+      var k3 = $('apiKeyGoogle'); if (k3) k3.placeholder = keysSet.google ? '•••••• (saved — leave blank to keep)' : 'AIza…';
+      var k4 = $('apiKeyXai'); if (k4) k4.placeholder = keysSet.xai ? '•••••• (saved — leave blank to keep)' : 'xai-…';
+    } catch (e) {
+      setStatus('cliStatus', 'Could not load CLI state: ' + e.message, 'err');
+    }
+  }
+
+  var apiKeysSaveBtn = $('apiKeysSave');
+  if (apiKeysSaveBtn) {
+    apiKeysSaveBtn.addEventListener('click', async function(){
+      var patch = { apiKeys: {} };
+      var fields = [['apiKeyAnthropic','anthropic'],['apiKeyOpenai','openai'],['apiKeyGoogle','google'],['apiKeyXai','xai']];
+      var any = false;
+      for (var i = 0; i < fields.length; i++) {
+        var el = $(fields[i][0]); if (!el) continue;
+        var v = el.value.trim();
+        if (v) { patch.apiKeys[fields[i][1]] = v; any = true; }
+      }
+      if (!any) { setStatus('apiKeysStatus', 'No new keys to save.', 'info'); return; }
+      setStatus('apiKeysStatus', 'Saving keys…', 'info');
+      markLocalMutate();
+      try {
+        await postJson('/api/settings/state', { chat: patch });
+        // Clear the fields so a refresh doesn't reveal what was typed.
+        fields.forEach(function(f){ var el = $(f[0]); if (el) el.value = ''; });
+        setStatus('apiKeysStatus', 'Saved ' + Object.keys(patch.apiKeys).length + ' key(s).', 'ok');
+        await loadCliState();
+      } catch (e) {
+        setStatus('apiKeysStatus', 'Failed: ' + e.message, 'err');
+      }
+    });
+  }
+  var apiKeysRevealBtn = $('apiKeysReveal');
+  if (apiKeysRevealBtn) {
+    apiKeysRevealBtn.addEventListener('click', function(){
+      var fields = ['apiKeyAnthropic','apiKeyOpenai','apiKeyGoogle','apiKeyXai'];
+      var anyPassword = fields.some(function(id){ var el = $(id); return el && el.type === 'password'; });
+      fields.forEach(function(id){ var el = $(id); if (el) el.type = anyPassword ? 'text' : 'password'; });
+    });
+  }
+
+  // ────── Custom provider modal ──────
+  function openProviderModal() {
+    var m = $('providerModal'); if (!m) return;
+    m.style.display = 'flex';
+    setStatus('providerModalStatus', '', 'info');
+    setTimeout(function(){ $('providerModalJson').focus(); }, 50);
+  }
+  function closeProviderModal() {
+    var m = $('providerModal'); if (m) m.style.display = 'none';
+  }
+  var addBtn = $('addCustomProviderBtn');
+  if (addBtn) addBtn.addEventListener('click', openProviderModal);
+  var closeBtn = $('providerModalClose');
+  if (closeBtn) closeBtn.addEventListener('click', closeProviderModal);
+  var cancelBtn = $('providerModalCancel');
+  if (cancelBtn) cancelBtn.addEventListener('click', closeProviderModal);
+  var exampleBtn = $('providerModalExample');
+  if (exampleBtn) exampleBtn.addEventListener('click', function(){
+    $('providerModalJson').value = JSON.stringify({
+      slug: 'ollama-local',
+      name: 'Ollama (local)',
+      apiBaseUrl: 'http://localhost:11434/v1'
+    }, null, 2);
+  });
+  var saveBtn = $('providerModalSave');
+  if (saveBtn) saveBtn.addEventListener('click', async function(){
+    var raw = ($('providerModalJson').value || '').trim();
+    if (!raw) { setStatus('providerModalStatus','Paste a JSON definition first.','err'); return; }
+    var parsed;
+    try { parsed = JSON.parse(raw); }
+    catch (e) { setStatus('providerModalStatus','Invalid JSON: ' + e.message,'err'); return; }
+    setStatus('providerModalStatus','Saving + probing endpoint…','info');
+    markLocalMutate();
+    try {
+      var r = await fetch(API + '/api/cli/providers', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(parsed)
+      });
+      var j = await r.json();
+      if (!j.ok) throw new Error(j.error || ('http ' + r.status));
+      var probed = j.provider || {};
+      var msg = 'Added ' + (probed.name || parsed.name) + ' — ';
+      if (probed.available) {
+        msg += probed.authError ? 'reachable but auth error' : (probed.models?.length || 0) + ' models detected';
+      } else {
+        msg += 'not reachable (' + (probed.error || 'no response') + ')';
+      }
+      setStatus('providerModalStatus', msg, probed.available && !probed.authError ? 'ok' : 'err');
+      await loadCliState();
+      if (probed.available && !probed.authError) {
+        setTimeout(closeProviderModal, 600);
+      }
+    } catch (e) {
+      setStatus('providerModalStatus','Failed: ' + e.message,'err');
+    }
+  });
+
+  // ────── Boot ──────
+  syncServerUi(${JSON.stringify(EMPIR3_SERVER)});
+  loadPermissionState();
+  loadCliState();
+  refreshStatus();
+  refreshActions();
+  refreshFocus();
+  refreshCalibration();
+  setInterval(refreshStatus, 5000);
+  setInterval(refreshActions, 8000);
+  setInterval(refreshFocus, 6000);
+  setInterval(loadCliState, 15000);
+  setInterval(refreshSettingsIfQuiet, 10000);
+</script>
+</body>
+</html>`;
