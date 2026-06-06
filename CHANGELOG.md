@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`--pair <code>` first-run auto-pairing.** `Empir3Setup.exe --pair <code>` redeems a pre-authorized Empir3 pairing session on first boot, so an install link can pair the bridge to an account with no second login.
 
+## [0.3.4] - 2026-06-06
+
+### Fixed
+- **Bridge no longer wedges when a second instance launches over a stale one.** The payload daemon binds the bridge + wrapper ports in-process but had no single-instance guard, so a daemon launched while a stale/wedged predecessor still held the ports would collide (EADDRINUSE, zombie Chrome, "CDP direct timeout"). The daemon now reaps a predecessor still holding the bridge/wrapper/CDP ports (only `node.exe`/`chrome.exe` — never an unrelated app) before binding, so a fresh launch reliably replaces a stuck one. The dev launcher (`npm run kill` / `npm start`) had the same gap — its port cleanup skipped the installed payload daemon, leaving two bridges colliding — and now reaps it too.
+
 ## [0.3.2] - 2026-06-04
 
 ### Fixed

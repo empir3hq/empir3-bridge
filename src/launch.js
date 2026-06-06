@@ -93,17 +93,33 @@ function killPort(port) {
   }
 }
 
+// Recognise any Empir3 Bridge process we are allowed to reap when freeing our
+// ports — BOTH the repo/dev process (tsx running our src) AND the installed
+// payload daemon (runs from ~/.empir3-bridge/payload, often under the bundled
+// node at ~/.empir3-bridge/node/<ver>/node.exe). Previously this matched only
+// the repo process, so the payload daemon was "left alone" and a second bridge
+// would stack on the same ports → EADDRINUSE, zombie Chromes, and CDP timeouts.
+// Only one bridge can own these ports, so a bridge incumbent must be reaped
+// before we (re)launch. The matches stay specific so an unrelated app that
+// merely happens to use the port is never touched.
 function isRepoBridgeProcess(pid) {
   try {
     const out = execSync(`wmic process where "ProcessId=${pid}" get CommandLine /value`, { encoding: 'utf-8' });
-    const cmd = out.toLowerCase();
-    const root = ROOT.toLowerCase().replace(/\//g, '\\');
-    return cmd.includes(root) && (
-      cmd.includes('src\\bridge.ts') ||
-      cmd.includes('src\\server.ts') ||
+    // Normalise every separator to '/' so matching is robust to how the path
+    // was written on the command line.
+    const cmd = out.toLowerCase().replace(/\\/g, '/');
+    const root = ROOT.toLowerCase().replace(/\\/g, '/');
+    const isRepo = cmd.includes(root) && (
       cmd.includes('src/bridge.ts') ||
-      cmd.includes('src/server.ts')
+      cmd.includes('src/server.ts') ||
+      cmd.includes('src/launch.js')
     );
+    // Installed payload daemon: the published bridge running out of the
+    // per-user state dir. Path is stable regardless of how it was launched.
+    const isPayloadDaemon =
+      cmd.includes('.empir3-bridge/payload') ||
+      cmd.includes('.empir3-bridge/node/');
+    return isRepo || isPayloadDaemon;
   } catch {
     return false;
   }
