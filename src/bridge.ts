@@ -82,6 +82,9 @@ let launchPromise: Promise<void> | null = null;
 let lastCdpLivenessAt = 0;
 let chromeEverStarted = false;
 let chromeExitCode: number | null = null;
+let chromeClosedByUser = false;
+let shuttingDown = false;
+let cdpCommandQueue: Promise<void> = Promise.resolve();
 
 // Element ref tracking
 let refMap = new Map<string, number>(); // ref string → CDP nodeId
@@ -106,6 +109,77 @@ function chromeStatus(): 'running' | 'exited' | 'not-started' {
   return chromeEverStarted ? 'exited' : 'not-started';
 }
 
+function closedBrowserError(): Error {
+  return new Error('Bridge browser is closed. Use browser_navigate or Open Bridge to reopen it.');
+}
+
+function markChromeClosedByUser(reason: string) {
+  if (!chromeClosedByUser) {
+    console.log(`[Empir3 Bridge] Bridge browser closed by user (${reason})`);
+  }
+  chromeClosedByUser = true;
+  connected = false;
+  lastCdpLivenessAt = 0;
+  currentTargetId = '';
+  knownTargets.clear();
+  if (cdpWs) { try { cdpWs.close(); } catch {} }
+  cdpWs = null;
+  stopTargetPolling();
+  if (browserReconnectTimer) {
+    clearTimeout(browserReconnectTimer);
+    browserReconnectTimer = null;
+  }
+  if (browserWs) { try { browserWs.close(); } catch {} }
+  browserWs = null;
+}
+
+// Guards against stacking concurrent close-confirmation checks (pollTargets can
+// fire one every 500ms while a check is still mid-flight).
+let closeCheckInFlight = false;
+
+// A single empty /json read is NOT proof the user closed the browser: during a
+// cross-process navigation Chrome briefly destroys the old page target before the
+// new one appears, and a refresh momentarily yields zero/changing targets. Latch
+// "closed by user" only after several consecutive confirmations (~500ms) while the
+// Chrome PROCESS is still alive — a genuine close also ends the process and is
+// caught separately by the chromeProcess 'exit' handler (markChromeClosedByUser
+// 'process exit'). This kills the post-refresh ONLINE->OFFLINE flap, where one
+// transient empty read used to latch the bridge "disconnected" permanently.
+async function markClosedIfNoPageTargets(reason: string): Promise<void> {
+  if (!chromeProcess || chromeClosedByUser || shuttingDown) return;
+  if (closeCheckInFlight) return;
+  closeCheckInFlight = true;
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (!chromeProcess || chromeClosedByUser || shuttingDown) return;
+      try {
+        const targets = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+        if (targets.some((t: any) => t.type === 'page')) return; // a page reappeared — not closed
+      } catch {
+        return; // /json hiccup — inconclusive; never latch closed on an error
+      }
+      if (attempt < 2) await sleep(250);
+    }
+    if (!chromeProcess || chromeClosedByUser || shuttingDown) return;
+    markChromeClosedByUser(reason);
+  } finally {
+    closeCheckInFlight = false;
+  }
+}
+
+async function terminateClosedChromeForRelaunch(): Promise<void> {
+  const proc = chromeProcess;
+  if (!proc) return;
+  try { proc.kill(); } catch {}
+  const deadline = Date.now() + 3000;
+  while (chromeProcess === proc && Date.now() < deadline) {
+    await sleep(100);
+  }
+  if (chromeProcess === proc) {
+    chromeProcess = null;
+  }
+}
+
 async function waitForChromeCDP(timeoutMs = CHROME_LAUNCH_TIMEOUT_MS): Promise<void> {
   const start = Date.now();
   let lastError: any = null;
@@ -126,9 +200,9 @@ async function waitForChromeCDP(timeoutMs = CHROME_LAUNCH_TIMEOUT_MS): Promise<v
   throw new Error(`Chrome did not expose CDP within ${Math.round(timeoutMs / 1000)}s${detail}`);
 }
 
-async function launchChrome(): Promise<void> {
+async function launchChrome(timeoutMs = CHROME_LAUNCH_TIMEOUT_MS): Promise<void> {
   if (chromeProcess) {
-    await waitForChromeCDP();
+    await waitForChromeCDP(timeoutMs);
     return;
   }
 
@@ -187,6 +261,7 @@ async function launchChrome(): Promise<void> {
   console.log(`[Empir3 Bridge] Chrome profile: ${PROFILE_DIR}`);
   chromeEverStarted = true;
   chromeExitCode = null;
+  chromeClosedByUser = false;
   chromeProcess = spawn(chromePath, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
@@ -202,27 +277,50 @@ async function launchChrome(): Promise<void> {
   chromeProcess.on('exit', (code) => {
     console.log(`[Empir3 Bridge] Chrome exited (code ${code})`);
     chromeExitCode = code;
-    connected = false;
-    cdpWs = null;
-    if (browserWs) { try { browserWs.close(); } catch {} }
-    browserWs = null;
+    if (!shuttingDown) {
+      markChromeClosedByUser('process exit');
+    } else {
+      connected = false;
+      cdpWs = null;
+      stopTargetPolling();
+      if (browserReconnectTimer) {
+        clearTimeout(browserReconnectTimer);
+        browserReconnectTimer = null;
+      }
+      if (browserWs) { try { browserWs.close(); } catch {} }
+      browserWs = null;
+    }
     chromeProcess = null;
   });
 
-  await waitForChromeCDP();
+  await waitForChromeCDP(timeoutMs);
 }
 
-async function ensureChromeReady(): Promise<void> {
+async function ensureChromeReady(opts: { allowRelaunch?: boolean; launchTimeoutMs?: number } = {}): Promise<void> {
+  const allowRelaunch = opts.allowRelaunch === true;
+  const launchTimeoutMs = Math.max(1000, opts.launchTimeoutMs || CHROME_LAUNCH_TIMEOUT_MS);
+  if (chromeClosedByUser && !allowRelaunch) {
+    throw closedBrowserError();
+  }
   if (await hasReachablePageTarget()) return;
+  if (chromeClosedByUser && allowRelaunch && chromeProcess) {
+    await terminateClosedChromeForRelaunch();
+  }
+  if (chromeClosedByUser && !allowRelaunch) {
+    throw closedBrowserError();
+  }
   if (launchPromise) {
     await launchPromise;
     if (await hasReachablePageTarget()) return;
+    if (chromeClosedByUser && !allowRelaunch) {
+      throw closedBrowserError();
+    }
   }
 
   launchPromise = (async () => {
     if (chromeProcess) {
       try {
-        await waitForChromeCDP();
+        await waitForChromeCDP(launchTimeoutMs);
         startTargetPolling();
         connectBrowserWs().catch(() => {});
         return;
@@ -233,7 +331,10 @@ async function ensureChromeReady(): Promise<void> {
       }
     }
 
-    await launchChrome();
+    if (chromeClosedByUser && !allowRelaunch) {
+      throw closedBrowserError();
+    }
+    await launchChrome(launchTimeoutMs);
     startTargetPolling();
     connectBrowserWs().catch(() => {});
   })();
@@ -246,31 +347,43 @@ async function ensureChromeReady(): Promise<void> {
 }
 
 async function showChromeWindow(preferredUrl?: string): Promise<string> {
-  await ensureChromeReady();
+  let href = preferredUrl || `http://localhost:${WRAPPER_PORT || PORT}/welcome`;
 
-  let href = preferredUrl || '';
+  try {
+    await ensureChromeReady({ allowRelaunch: true, launchTimeoutMs: 5000 });
+  } catch (e: any) {
+    if (chromeProcess) {
+      console.warn(`[Empir3 Bridge] Open Bridge launched Chrome, but CDP was not ready yet: ${e?.message || e}`);
+      return href;
+    }
+    throw e;
+  }
+
+  if (!preferredUrl) {
+    href = '';
+  }
   if (!href) {
     try {
-      const current = await cdpEvaluate('location.href');
+      const current = await cdpEvaluate('location.href', 1000);
       href = typeof current === 'string' && current ? current : '';
     } catch {}
   }
   if (!href || href === 'about:blank') href = `http://localhost:${WRAPPER_PORT || PORT}/welcome`;
 
   try {
-    const info = await cdpSend('Browser.getWindowForTarget', { targetId: currentTargetId });
+    const info = await cdpSend('Browser.getWindowForTarget', { targetId: currentTargetId }, 1000);
     if (info?.windowId) {
       await cdpSend('Browser.setWindowBounds', {
         windowId: info.windowId,
         bounds: { windowState: 'normal' },
-      });
+      }, 1000);
     }
   } catch {}
 
-  try { await cdpSend('Page.bringToFront'); } catch {}
+  try { await cdpSend('Page.bringToFront', {}, 1000); } catch {}
 
   try {
-    const current = await cdpEvaluate('location.href');
+    const current = await cdpEvaluate('location.href', 1000);
     if (!current || current === 'about:blank') {
       await cdpNavigate(href);
     }
@@ -278,7 +391,7 @@ async function showChromeWindow(preferredUrl?: string): Promise<string> {
     await cdpNavigate(href);
   }
 
-  try { await cdpSend('Page.bringToFront'); } catch {}
+  try { await cdpSend('Page.bringToFront', {}, 1000); } catch {}
   return href;
 }
 
@@ -341,6 +454,26 @@ async function connectCDP(): Promise<void> {
 
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(target.webSocketDebuggerUrl);
+    let settled = false;
+    const timer = setTimeout(() => fail(new Error('CDP WebSocket timeout')), 5000);
+    const fail = (e: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (cdpWs === ws) {
+        connected = false;
+        cdpWs = null;
+        lastCdpLivenessAt = 0;
+      }
+      try { ws.close(); } catch {}
+      reject(e);
+    };
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
 
     ws.on('open', async () => {
       cdpWs = ws;
@@ -349,7 +482,7 @@ async function connectCDP(): Promise<void> {
       console.log(`[Empir3 Bridge] CDP connected to: ${target.url}`);
 
       if (!(await verifyCdpConnection())) {
-        reject(new Error('CDP liveness check failed'));
+        fail(new Error('CDP liveness check failed'));
         return;
       }
 
@@ -387,7 +520,7 @@ async function connectCDP(): Promise<void> {
         freshConsumed = true;
       }
 
-      resolve();
+      done();
     });
 
     ws.on('message', (data: Buffer) => {
@@ -415,15 +548,8 @@ async function connectCDP(): Promise<void> {
     });
 
     ws.on('error', (e) => {
-      if (cdpWs === ws) {
-        connected = false;
-        cdpWs = null;
-        lastCdpLivenessAt = 0;
-      }
-      reject(e);
+      fail(e);
     });
-
-    setTimeout(() => reject(new Error('CDP WebSocket timeout')), 5000);
   });
 }
 
@@ -432,55 +558,12 @@ async function switchToTarget(targetId: string): Promise<void> {
   const target = res.find((t: any) => t.id === targetId);
   if (!target) throw new Error(`Target ${targetId} not found`);
 
-  if (cdpWs) cdpWs.close();
-
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(target.webSocketDebuggerUrl);
-    ws.on('open', async () => {
-      cdpWs = ws;
-      connected = true;
-      currentTargetId = targetId;
-      lastCdpLivenessAt = 0;
-      // Enable Page domain + bring tab to foreground so user sees the active tab
-      try {
-        await cdpSend('Page.enable');
-        await cdpSend('Page.bringToFront');
-        lastCdpLivenessAt = Date.now();
-      } catch {}
-      console.log(`[Empir3 Bridge] Switched to target: ${target.url}`);
-      resolve();
-    });
-    ws.on('message', (data: Buffer) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.id && cdpCallbacks.has(msg.id)) {
-          const cb = cdpCallbacks.get(msg.id)!;
-          cdpCallbacks.delete(msg.id);
-          if (msg.error) cb.reject(new Error(msg.error.message));
-          else {
-            lastCdpLivenessAt = Date.now();
-            cb.resolve(msg.result);
-          }
-        }
-      } catch {}
-    });
-    ws.on('close', () => {
-      if (cdpWs === ws) {
-        connected = false;
-        cdpWs = null;
-        lastCdpLivenessAt = 0;
-      }
-    });
-    ws.on('error', (e) => {
-      if (cdpWs === ws) {
-        connected = false;
-        cdpWs = null;
-        lastCdpLivenessAt = 0;
-      }
-      reject(e);
-    });
-    setTimeout(() => reject(new Error('CDP switch timeout')), 5000);
-  });
+  currentTargetId = targetId;
+  connected = true;
+  lastCdpLivenessAt = Date.now();
+  try { await cdpSend('Page.enable', {}, 2000); } catch {}
+  try { await cdpSend('Page.bringToFront', {}, 2000); } catch {}
+  console.log(`[Empir3 Bridge] Switched to target: ${target.url}`);
 }
 
 function markCdpDisconnected(reason: string) {
@@ -500,6 +583,33 @@ function markCdpDisconnected(reason: string) {
   cdpCallbacks.clear();
 }
 
+async function closePrimaryCdpForDirectCommand(): Promise<void> {
+  const ws = cdpWs;
+  if (!ws) return;
+  cdpWs = null;
+  connected = false;
+  const state = ws.readyState;
+  if (state === WebSocket.CLOSED || state === WebSocket.CLOSING) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    ws.once('close', finish);
+    ws.once('error', finish);
+    try { ws.close(); } catch { finish(); }
+    setTimeout(finish, 250);
+  });
+}
+
+function withCdpCommandLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = cdpCommandQueue.then(fn, fn);
+  cdpCommandQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 function cdpSendRaw(method: string, params: any = {}, timeoutMs = NAV_TIMEOUT, resetOnTimeout = true): Promise<any> {
   return new Promise((resolve, reject) => {
     if (!cdpWs || cdpWs.readyState !== WebSocket.OPEN) {
@@ -517,6 +627,66 @@ function cdpSendRaw(method: string, params: any = {}, timeoutMs = NAV_TIMEOUT, r
       }
     }, timeoutMs);
   });
+}
+
+async function sendDirectCdpCommand(method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  const target = await currentPageTarget();
+  await closePrimaryCdpForDirectCommand();
+  const result = await cdpSendViaDirectWs(target.webSocketDebuggerUrl, method, params, timeoutMs);
+  connected = true;
+  lastCdpLivenessAt = Date.now();
+  currentTargetId = target.id;
+  return result;
+}
+
+async function sendDetachedCdpCommand(method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  const target = await currentPageTarget();
+  const result = await cdpSendViaDirectWs(target.webSocketDebuggerUrl, method, params, timeoutMs);
+  connected = true;
+  lastCdpLivenessAt = Date.now();
+  currentTargetId = target.id;
+  return result;
+}
+
+async function ensureBrowserWsReady(timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + Math.max(500, timeoutMs);
+  while (Date.now() < deadline) {
+    if (browserWs && browserWs.readyState === WebSocket.OPEN) return;
+    await connectBrowserWs().catch(() => {});
+    if (browserWs && browserWs.readyState === WebSocket.OPEN) return;
+    await sleep(100);
+  }
+  throw new Error('Browser WS not connected');
+}
+
+function isBrowserDomainMethod(method: string): boolean {
+  return method.startsWith('Browser.') || method.startsWith('Target.');
+}
+
+async function sendCdpCommandViaBrowserSession(method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  await ensureBrowserWsReady(timeoutMs);
+
+  if (isBrowserDomainMethod(method)) {
+    const result = await browserSend(method, params, timeoutMs);
+    connected = true;
+    lastCdpLivenessAt = Date.now();
+    return result;
+  }
+
+  const target = await currentPageTarget();
+  currentTargetId = target.id;
+  const attachResult = await browserSend('Target.attachToTarget', { targetId: target.id, flatten: true }, timeoutMs);
+  const sessionId = attachResult?.sessionId;
+  if (!sessionId) throw new Error('No sessionId from attachToTarget');
+
+  try {
+    const result = await browserSendWithSession(sessionId, method, params, timeoutMs);
+    connected = true;
+    lastCdpLivenessAt = Date.now();
+    return result;
+  } finally {
+    try { await browserSend('Target.detachFromTarget', { sessionId }, 1500); } catch {}
+  }
 }
 
 async function verifyCdpConnection(): Promise<boolean> {
@@ -549,7 +719,6 @@ async function hasReachablePageTarget(): Promise<boolean> {
   try {
     const target = await currentPageTarget();
     if (!target?.webSocketDebuggerUrl) return false;
-    connected = true;
     return true;
   } catch {
     return false;
@@ -561,11 +730,20 @@ function cdpSendViaDirectWs(wsUrl: string, method: string, params: any = {}, tim
     const ws = new WebSocket(wsUrl);
     const id = cdpId++;
     let settled = false;
-    const timer = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (err?: Error, result?: any) => {
       if (settled) return;
       settled = true;
-      try { ws.close(); } catch {}
-      reject(new Error(`CDP direct timeout: ${method}`));
+      clearTimeout(timer);
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+      } catch {}
+      if (err) reject(err);
+      else resolve(result);
+    };
+    timer = setTimeout(() => {
+      try { (ws as any).terminate?.(); } catch {}
+      finish(new Error(`CDP direct timeout: ${method}`));
     }, timeoutMs);
 
     ws.on('open', () => {
@@ -577,39 +755,58 @@ function cdpSendViaDirectWs(wsUrl: string, method: string, params: any = {}, tim
       try {
         const msg = JSON.parse(data.toString());
         if (msg.id !== id) return;
-        settled = true;
-        clearTimeout(timer);
-        try { ws.close(); } catch {}
-        if (msg.error) reject(new Error(msg.error.message));
+        if (msg.error) finish(new Error(msg.error.message));
         else {
           lastCdpLivenessAt = Date.now();
-          resolve(msg.result);
+          finish(undefined, msg.result);
         }
       } catch (e: any) {
-        settled = true;
-        clearTimeout(timer);
-        try { ws.close(); } catch {}
-        reject(e);
+        finish(e);
       }
     });
 
     ws.on('error', (e) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(e);
+      finish(e instanceof Error ? e : new Error(String(e)));
+    });
+
+    ws.on('close', () => {
+      finish(new Error(`CDP direct connection closed: ${method}`));
     });
   });
 }
 
 async function cdpSend(method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
-  const target = await currentPageTarget();
-  if (cdpWs) {
-    try { cdpWs.close(); } catch {}
-    cdpWs = null;
-  }
-  connected = true;
-  return cdpSendViaDirectWs(target.webSocketDebuggerUrl, method, params, timeoutMs);
+  return withCdpCommandLock(async () => {
+    try {
+      return await sendDetachedCdpCommand(method, params, timeoutMs);
+    } catch (e: any) {
+      const message = String(e?.message || e);
+      if (!/CDP not connected|CDP timeout|CDP connection reset|WebSocket|Browser WS|connection closed/i.test(message)) {
+        throw e;
+      }
+
+      await connectCDP().catch(() => {});
+      return sendDetachedCdpCommand(method, params, timeoutMs);
+    }
+  });
+}
+
+async function cdpSendNoReset(method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  return withCdpCommandLock(() => sendDetachedCdpCommand(method, params, timeoutMs));
+}
+
+async function captureScreenshot(params: any): Promise<any> {
+  return withCdpCommandLock(async () => {
+    try { await sendDetachedCdpCommand('Page.enable', {}, 2000); } catch {}
+    try {
+      return await sendDetachedCdpCommand('Page.captureScreenshot', params, Math.max(CDP_COMMAND_TIMEOUT_MS, 15000));
+    } catch (e: any) {
+      if (!/timeout|not connected|connection reset|connection closed/i.test(String(e?.message || e))) throw e;
+      await connectCDP().catch(() => {});
+      try { await sendDetachedCdpCommand('Page.enable', {}, 2000); } catch {}
+      return sendDetachedCdpCommand('Page.captureScreenshot', params, Math.max(CDP_COMMAND_TIMEOUT_MS, 15000));
+    }
+  });
 }
 
 async function autoDenyPermissions(): Promise<void> {
@@ -772,7 +969,7 @@ async function evaluateOnTarget(targetId: string, expression: string, timeoutMs 
 
   // Fallback: use browser WS with Target.attachToTarget (for user-opened tabs not in /json)
   if (browserWs && browserWs.readyState === WebSocket.OPEN) {
-    return await evaluateViaBrowserSession(targetId, expression);
+    return await evaluateViaBrowserSession(targetId, expression, timeoutMs);
   }
 
   throw new Error(`Target ${targetId} not reachable via /json or browser WS`);
@@ -780,9 +977,24 @@ async function evaluateOnTarget(targetId: string, expression: string, timeoutMs 
 
 /** Evaluate via a temporary direct WS connection to a target */
 function evaluateViaDirectWs(wsUrl: string, expression: string, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
-  return new Promise((resolve, reject) => {
+  return withCdpCommandLock(() => new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
-    const timer = setTimeout(() => { try { ws.close(); } catch {} reject(new Error('evaluate-on-target timeout')); }, timeoutMs);
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (err?: Error, result?: any) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+      } catch {}
+      if (err) reject(err);
+      else resolve(result);
+    };
+    timer = setTimeout(() => {
+      try { (ws as any).terminate?.(); } catch {}
+      finish(new Error('evaluate-on-target timeout'));
+    }, timeoutMs);
 
     ws.on('open', () => {
       const id = cdpId++;
@@ -795,27 +1007,28 @@ function evaluateViaDirectWs(wsUrl: string, expression: string, timeoutMs = CDP_
         try {
           const msg = JSON.parse(data.toString());
           if (msg.id === id) {
-            clearTimeout(timer);
-            ws.close();
-            if (msg.error) reject(new Error(msg.error.message));
-            else resolve(msg.result?.result?.value);
+            if (msg.error) finish(new Error(msg.error.message));
+            else finish(undefined, msg.result?.result?.value);
           }
-        } catch {}
+        } catch (e: any) {
+          finish(e);
+        }
       });
     });
 
-    ws.on('error', (e) => { clearTimeout(timer); reject(e); });
-  });
+    ws.on('error', (e) => finish(e instanceof Error ? e : new Error(String(e))));
+    ws.on('close', () => finish(new Error('evaluate-on-target connection closed')));
+  }));
 }
 
 /** Evaluate via browser WS using Target.attachToTarget flat session */
-async function evaluateViaBrowserSession(targetId: string, expression: string): Promise<any> {
+async function evaluateViaBrowserSession(targetId: string, expression: string, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
   if (!browserWs || browserWs.readyState !== WebSocket.OPEN) {
     throw new Error('Browser WS not connected');
   }
 
   // Attach to target to get a session
-  const attachResult = await browserSend('Target.attachToTarget', { targetId, flatten: true });
+  const attachResult = await browserSend('Target.attachToTarget', { targetId, flatten: true }, timeoutMs);
   const sessionId = attachResult?.sessionId;
   if (!sessionId) throw new Error('No sessionId from attachToTarget');
 
@@ -823,19 +1036,19 @@ async function evaluateViaBrowserSession(targetId: string, expression: string): 
     // Evaluate via the flat session
     const evalResult = await browserSendWithSession(sessionId, 'Runtime.evaluate', {
       expression, returnByValue: true, awaitPromise: true,
-    });
+    }, timeoutMs);
 
     return evalResult?.result?.value;
   } finally {
     // Detach to clean up
     try {
-      await browserSend('Target.detachFromTarget', { sessionId });
+      await browserSend('Target.detachFromTarget', { sessionId }, 1500);
     } catch {}
   }
 }
 
 /** Send a command on the browser WS (no session) */
-function browserSend(method: string, params: any = {}): Promise<any> {
+function browserSend(method: string, params: any = {}, timeoutMs = 10000): Promise<any> {
   return new Promise((resolve, reject) => {
     if (!browserWs || browserWs.readyState !== WebSocket.OPEN) {
       return reject(new Error('Browser WS not connected'));
@@ -848,12 +1061,12 @@ function browserSend(method: string, params: any = {}): Promise<any> {
         browserCallbacks.delete(id);
         reject(new Error(`Browser WS timeout: ${method}`));
       }
-    }, 10000);
+    }, timeoutMs);
   });
 }
 
 /** Send a command on the browser WS with a flat-session sessionId */
-function browserSendWithSession(sessionId: string, method: string, params: any = {}): Promise<any> {
+function browserSendWithSession(sessionId: string, method: string, params: any = {}, timeoutMs = 10000): Promise<any> {
   return new Promise((resolve, reject) => {
     if (!browserWs || browserWs.readyState !== WebSocket.OPEN) {
       return reject(new Error('Browser WS not connected'));
@@ -866,7 +1079,7 @@ function browserSendWithSession(sessionId: string, method: string, params: any =
         browserCallbacks.delete(id);
         reject(new Error(`Browser session timeout: ${method}`));
       }
-    }, 10000);
+    }, timeoutMs);
   });
 }
 
@@ -891,10 +1104,29 @@ async function evaluateOnAllTargets(expression: string, timeoutMs = CDP_COMMAND_
 
 // ─── Target Discovery — poll for new tabs and auto-inject ────
 
+// Auto-inject must not hold the single global CDP command lock for the full 10s
+// default — a stalled eval against a heavy page (e.g. the bridge's own welcome
+// console) would block every other CDP op and starve the shared event loop, so
+// trivial HTTP handlers (/api/status, /api/relay-status) queue for seconds and the
+// tray's liveness poll times out. Cap it short so a stuck inject releases the lock fast.
+const AUTO_INJECT_TIMEOUT_MS = 2000;
+let pollInFlight = false;
 async function pollTargets() {
+  // Never overlap: a single auto-inject can await up to AUTO_INJECT_TIMEOUT_MS, which
+  // is longer than the 500ms poll interval. Without this guard, successive ticks pile
+  // concurrent fresh-WS Runtime.evaluate calls onto the loop — the saturation storm.
+  if (pollInFlight) return;
+  pollInFlight = true;
   try {
     const targets = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
     const pages = targets.filter((t: any) => t.type === 'page');
+    if (pages.length === 0) {
+      // Don't latch closed on a single empty poll — route through the debounced
+      // confirmation, which re-polls /json a few times before concluding the user
+      // closed the browser. Prevents the transient-empty post-refresh flap.
+      markClosedIfNoPageTargets('no page targets in poll').catch(() => {});
+      return;
+    }
 
     for (const page of pages) {
       const prevUrl = knownTargets.get(page.id);
@@ -915,10 +1147,10 @@ async function pollTargets() {
           console.log(`[Empir3 Bridge] Tab navigated: ${prevUrl} → ${page.url} (${page.id})`);
         }
 
-        // Auto-inject registered script
+        // Auto-inject registered script (short timeout — see AUTO_INJECT_TIMEOUT_MS).
         if (autoInjectScript) {
           try {
-            await evaluateOnTarget(page.id, autoInjectScript);
+            await evaluateOnTarget(page.id, autoInjectScript, AUTO_INJECT_TIMEOUT_MS);
             console.log(`[Empir3 Bridge] Auto-injected into: ${page.url}`);
           } catch (e: any) {
             console.log(`[Empir3 Bridge] Auto-inject failed for ${page.url}: ${e.message?.slice(0, 60)}`);
@@ -936,6 +1168,8 @@ async function pollTargets() {
     }
   } catch {
     // Bridge may be busy or Chrome not ready
+  } finally {
+    pollInFlight = false;
   }
 }
 
@@ -1024,6 +1258,7 @@ async function connectBrowserWs(): Promise<void> {
 
           if (msg.method === 'Target.targetDestroyed') {
             knownTargets.delete(msg.params?.targetId);
+            markClosedIfNoPageTargets('last page target destroyed').catch(() => {});
           }
         } catch {}
       });
@@ -1031,8 +1266,10 @@ async function connectBrowserWs(): Promise<void> {
       ws.on('close', () => {
         if (browserWs === ws) {
           browserWs = null;
-          console.log('[Empir3 Bridge] Browser WS disconnected - reconnecting in 3s');
-          if (!browserReconnectTimer) {
+          if (!chromeProcess || chromeClosedByUser || shuttingDown) {
+            console.log('[Empir3 Bridge] Browser WS disconnected');
+          } else if (!browserReconnectTimer) {
+            console.log('[Empir3 Bridge] Browser WS disconnected - reconnecting in 3s');
             browserReconnectTimer = setTimeout(() => {
               browserReconnectTimer = null;
               connectBrowserWs().catch(() => {});
@@ -1115,7 +1352,7 @@ async function cdpScreenshot(maxWidth?: number): Promise<Buffer> {
       }
     } catch {}
   }
-  const result = await cdpSend('Page.captureScreenshot', params);
+  const result = await captureScreenshot(params);
   return Buffer.from(result.data, 'base64');
 }
 
@@ -1659,13 +1896,16 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
   // Health — no auth needed
   if (path === '/health') {
-    const reachable = await hasReachablePageTarget();
-    const cdpConnected = !!cdpWs && cdpWs.readyState === WebSocket.OPEN;
+    const hasOpenCdpSocket = !!cdpWs && cdpWs.readyState === WebSocket.OPEN;
+    const hasRecentCdpCommand = connected && lastCdpLivenessAt > 0 && Date.now() - lastCdpLivenessAt < 15000;
+    const hasKnownPage = !!currentTargetId || knownTargets.size > 0;
+    const cdpConnected = !chromeClosedByUser && chromeStatus() === 'running' && (hasOpenCdpSocket || hasRecentCdpCommand || hasKnownPage);
     sendJSON(res, {
-      status: reachable ? 'connected' : 'disconnected',
+      status: cdpConnected ? 'connected' : 'disconnected',
       port: PORT,
       cdpPort: CDP_PORT,
       chrome: chromeStatus(),
+      closedByUser: chromeClosedByUser,
       cdpConnected,
     });
     return;
@@ -1694,7 +1934,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
     if (method === 'GET' && path === '/screenshot') {
       await ensureChromeReady();
-      if (!connected) throw new Error('Not connected');
       const quality = parseInt(url.searchParams.get('quality') || '80');
       const maxWidth = url.searchParams.get('maxWidth') ? parseInt(url.searchParams.get('maxWidth')!) : undefined;
       const params: any = { format: 'jpeg', quality };
@@ -1714,7 +1953,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
           }
         } catch {}
       }
-      const result = await cdpSend('Page.captureScreenshot', params);
+      const result = await captureScreenshot(params);
       const buf = Buffer.from(result.data, 'base64');
       if (url.searchParams.get('format') === 'json') {
         // Only return JSON if explicitly requested
@@ -1733,7 +1972,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
     if (method === 'GET' && path === '/snapshot') {
       await ensureChromeReady();
-      if (!connected) throw new Error('Not connected');
       const filter = url.searchParams.get('filter') || 'interactive';
       const nodes = await getAccessibilityTree(filter);
       sendJSON(res, { count: nodes.length, nodes });
@@ -1742,7 +1980,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
     if (method === 'GET' && path === '/text') {
       await ensureChromeReady();
-      if (!connected) throw new Error('Not connected');
       const text = await cdpEvaluate(`(function() {
         const title = document.title || '';
         // The bridge injects its overlay UI (chat sidebar, toolbar, ghost
@@ -1772,7 +2009,27 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     }
 
     if (method === 'GET' && path === '/tabs') {
-      const targets = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+      let targets: any[] = [];
+      try {
+        targets = await Promise.race([
+          fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`),
+          sleep(1500).then(() => null),
+        ]) as any[] | null || [];
+      } catch {
+        sendJSON(res, { tabs: [], currentTargetId: '', chrome: chromeStatus(), closedByUser: chromeClosedByUser });
+        return;
+      }
+      if (!targets.length && knownTargets.size > 0) {
+        const tabs = Array.from(knownTargets.entries()).map(([id, url]) => ({
+          id,
+          title: '',
+          url,
+          type: 'page',
+          active: id === currentTargetId,
+        }));
+        sendJSON(res, { tabs, currentTargetId, chrome: chromeStatus(), closedByUser: chromeClosedByUser });
+        return;
+      }
       const tabs = targets
         .filter((t: any) => t.type === 'page')
         .map((t: any) => ({
@@ -1782,7 +2039,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
           type: t.type,
           active: t.id === currentTargetId,
         }));
-      sendJSON(res, { tabs, currentTargetId });
+      sendJSON(res, { tabs, currentTargetId, chrome: chromeStatus(), closedByUser: chromeClosedByUser });
       return;
     }
 
@@ -1827,7 +2084,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       }
 
       if (path === '/activate-target') {
-        await ensureChromeReady();
+        await ensureChromeReady({ allowRelaunch: false });
         const targetId = typeof body.targetId === 'string' ? body.targetId : '';
         if (!targetId) throw new Error('activate-target requires targetId');
         await switchToTarget(targetId);
@@ -1851,8 +2108,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       }
 
       if (path === '/navigate') {
-        await ensureChromeReady();
-        if (!connected) throw new Error('Not connected');
+        await ensureChromeReady({ allowRelaunch: true });
         const targetUrl = typeof body.url === 'string' && body.url.trim() ? body.url.trim() : '';
         if (!targetUrl) throw new Error('navigate requires a non-empty url');
         // Check if URL is already open in another tab
@@ -1884,7 +2140,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
       if (path === '/action') {
         await ensureChromeReady();
-        if (!connected) throw new Error('Not connected');
         const kind = body.kind;
 
         switch (kind) {
@@ -2040,7 +2295,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
       if (path === '/evaluate') {
         await ensureChromeReady();
-        if (!connected) throw new Error('Not connected');
         const result = await cdpEvaluate(body.expression);
         sendJSON(res, { result });
         return;
@@ -2048,7 +2302,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
       if (path === '/cookies') {
         await ensureChromeReady();
-        if (!connected) throw new Error('Not connected');
         for (const cookie of (body.cookies || [])) {
           await cdpSend('Network.setCookie', {
             name: cookie.name,
@@ -2119,6 +2372,7 @@ async function fetchJSON(url: string, method: string = 'GET'): Promise<any> {
 
 function shutdown() {
   console.log('[Empir3 Bridge] Shutting down...');
+  shuttingDown = true;
   stopTargetPolling();
   if (browserWs) { try { browserWs.close(); } catch {} }
   if (cdpWs) cdpWs.close();

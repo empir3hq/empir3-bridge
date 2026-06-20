@@ -344,6 +344,8 @@ interface BridgeCommand {
   recording?: string;
   speed?: number;
   variables?: Record<string, string>;
+  // playback transport control (playback_seek)
+  step?: number;
 }
 
 const COMPANION_COMMAND_PREFIXES = new Set([
@@ -515,6 +517,45 @@ let recordingStartUrl = '';
 let lastActionTime = 0;
 let recentBridgeRecordedActions: Array<{ action: RecordedAction; at: number }> = [];
 let isPlaying = false;
+
+// Live transport state for an in-flight playback. Control commands
+// (playback_pause / resume / stop / seek / speed / step) mutate this object;
+// the playRecording loop reads it between actions. Because the loop awaits
+// (inter-action delays + CDP calls), control commands arriving on a separate
+// HTTP/WS request are handled concurrently and take effect on the next tick.
+interface PlaybackControl {
+  paused: boolean;
+  stop: boolean;
+  speed: number;
+  seekTo: number | null;  // absolute 0-based action index to jump to
+  stepOnce: boolean;      // advance exactly one action then re-pause
+  current: number;        // current 0-based action index
+  total: number;
+  name: string;
+  action: string;         // current action label (so a synced overlay shows it, not "Starting…")
+  ref: string;
+}
+let playbackControl: PlaybackControl = {
+  paused: false, stop: false, speed: 1, seekTo: null, stepOnce: false, current: 0, total: 0, name: '', action: '', ref: '',
+};
+function resetPlaybackControl() {
+  playbackControl = { paused: false, stop: false, speed: 1, seekTo: null, stepOnce: false, current: 0, total: 0, name: '', action: '', ref: '' };
+}
+/** Snapshot of transport state broadcast to the overlay so it can render the scrubber. */
+function transportSnapshot(extra: Record<string, any> = {}) {
+  return {
+    type: 'playback_transport',
+    active: isPlaying,
+    paused: playbackControl.paused,
+    speed: playbackControl.speed,
+    current: playbackControl.current,
+    total: playbackControl.total,
+    name: playbackControl.name,
+    action: playbackControl.action,
+    ref: playbackControl.ref,
+    ...extra,
+  };
+}
 
 function readPackageVersion(): string {
   try {
@@ -942,18 +983,51 @@ function saveBridgeSettingsPatch(patch: any = {}) {
   return publicBridgeSettings(next);
 }
 
+// CLI probes spawn `<cli> --version` for each lent CLI — and some are very
+// expensive (agy --version boots a 15-20s runtime; gemini/codex boot Node + load
+// large bundles). The welcome console polls /api/settings/state every 10-15s; with
+// no cache those ~7 probes re-spawn on every poll, the slow (≈19s) calls OVERLAP,
+// and the concurrent runtime-boot processes peg a core and saturate the daemon's
+// shared event loop — which is what made /api/status / /api/relay-status take 5-8s
+// and the tray show "Daemon not running". Cache the probe results; CLI
+// install/version state changes rarely, and install/auth actions bust the cache.
+let _cliProbeCache: { at: number; value: any[] } | null = null;
+let _cliProbeInFlight: Promise<any[]> | null = null;
+const CLI_PROBE_TTL_MS = 60000;
+function invalidateCliProbeCache() { _cliProbeCache = null; }
+async function probeAllClis(): Promise<any[]> {
+  if (_cliProbeCache && Date.now() - _cliProbeCache.at < CLI_PROBE_TTL_MS) {
+    return _cliProbeCache.value;
+  }
+  // Single-flight: while a probe is running (agy alone can take 15-20s), concurrent
+  // callers (overlapping welcome-page polls) MUST share the one in-flight probe —
+  // otherwise a thundering herd each spawns its own ~7 `--version` processes and the
+  // concurrent runtime boots peg the core. The TTL cache then spares the repeats.
+  if (_cliProbeInFlight) return _cliProbeInFlight;
+  _cliProbeInFlight = (async () => {
+    try {
+      const value = await Promise.all([
+        probeClaudeCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: claudeDeviceOptedIn() })),
+        probeCodexCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: codexDeviceOptedIn() })),
+        probeGeminiCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: geminiDeviceOptedIn() })),
+        probeGrokCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: grokDeviceOptedIn() })),
+        probeAgyCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: agyDeviceOptedIn() })),
+        probeHiggsfieldCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: false, authenticated: false })),
+        probeGithubCli(githubDeviceOptedIn(), githubScopes()).catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: githubDeviceOptedIn(), authenticated: false, scopes: githubScopes() })),
+      ]);
+      _cliProbeCache = { at: Date.now(), value };
+      return value;
+    } finally {
+      _cliProbeInFlight = null;
+    }
+  })();
+  return _cliProbeInFlight;
+}
+
 async function buildSettingsState() {
   const auth = readBridgeAuth();
   const paired = !!(EMPIR3_WS_URL && (EMPIR3_AUTH_TOKEN || auth?.legacyToken || auth?.token));
-  const [claude, codex, gemini, grok, agy, higgsfield, github] = await Promise.all([
-    probeClaudeCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: claudeDeviceOptedIn() })),
-    probeCodexCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: codexDeviceOptedIn() })),
-    probeGeminiCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: geminiDeviceOptedIn() })),
-    probeGrokCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: grokDeviceOptedIn() })),
-    probeAgyCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: agyDeviceOptedIn() })),
-    probeHiggsfieldCli().catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: false, authenticated: false })),
-    probeGithubCli(githubDeviceOptedIn(), githubScopes()).catch((e: any) => ({ available: false, path: null, version: null, error: e?.message || String(e), device_opted_in: githubDeviceOptedIn(), authenticated: false, scopes: githubScopes() })),
-  ]);
+  const [claude, codex, gemini, grok, agy, higgsfield, github] = await probeAllClis();
   // Attach auth signals for CLIs where the probe doesn't already supply
   // one. Higgsfield's probe already includes `authenticated` from the
   // handler. Phase 3 — feeds the per-row Auth-status badge.
@@ -1241,7 +1315,10 @@ function requiredBridgePermission(cmd: BridgeCommand): 'read' | 'write' | 'execu
   // read so it works while the rest of the (execute) group is off.
   if (toolName === 'desktop_toolbar' && String((cmd as any).action || 'show').toLowerCase() === 'status') return 'read';
   if (toolName && TOOL_PERMISSION_REQUIREMENTS[toolName] !== undefined) return TOOL_PERMISSION_REQUIREMENTS[toolName];
-  if (type.startsWith('claude:cli:') || type.startsWith('codex:cli:') || type.startsWith('gemini:cli:') || type.startsWith('grok:cli:') || type.startsWith('agy:cli:')) return 'execute';
+  // A `:probe` is a read-only capability check (spawns `<cli> --version`,
+  // reports lend/auth state) — classify it as 'read' so the website's Execute
+  // policy can stay OFF while the server still learns which CLIs are available.
+  if (type.startsWith('claude:cli:') || type.startsWith('codex:cli:') || type.startsWith('gemini:cli:') || type.startsWith('grok:cli:') || type.startsWith('agy:cli:')) return /:probe$/.test(type) ? 'read' : 'execute';
   if (type === 'higgsfield_generate') return 'execute';
   if (type === 'higgsfield_status' || type === 'higgsfield_list' || type === 'higgsfield_models') return 'read';
   if (type === 'cli_run') return 'execute';
@@ -1282,6 +1359,14 @@ function requiredBridgePermission(cmd: BridgeCommand): 'read' | 'write' | 'execu
 function sourceUsesLocalMcpPolicy(cmd: BridgeCommand, source: string): boolean {
   return cmd.channel === 'mcp' || source === 'mcp' || source.includes('overlay');
 }
+
+// Read-only CLI actions (capability probes) must work even when the empir3
+// Execute permission is OFF — advertising "this CLI is installed + lent +
+// opted-in" runs nothing. Only turn/see/abort/tool:result actually execute.
+// Gating the probe behind Execute made the server believe lent CLIs were
+// unavailable, so it silently fell back to a server-local CLI instead of the
+// user's bridge. Keep the probe ungated; the real run actions stay gated.
+const READ_ONLY_CLI_ACTIONS = new Set(['probe']);
 
 function enforceCommandPolicy(cmd: BridgeCommand, source: string) {
   const permission = requiredBridgePermission(cmd);
@@ -1474,7 +1559,12 @@ function buildLocalProjectManifest() {
       if (st.isDirectory()) {
         walk(full, rel, files);
       } else if (st.isFile() && st.size <= MAX_SYNC_FILE_BYTES) {
-        files.push({ path: rel, size: st.size, mtimeMs: st.mtimeMs, hash: fileSha256(full) });
+        // Do NOT read+sha256 every file on every walk. This loop runs every 5s, and
+        // hashing the entire workspace each tick pegged a core and blocked the event
+        // loop (so /api/status & /api/relay-status took 5-8s and the tray showed the
+        // daemon offline) once the workspace grew. Use size+mtime as the cheap change
+        // signal; the sha256 is computed lazily below ONLY for files that changed.
+        files.push({ path: rel, size: st.size, mtimeMs: st.mtimeMs, hash: '' });
       }
     }
   };
@@ -1524,7 +1614,11 @@ function startLocalProjectSyncLoop() {
           const full = join(projectDir, sanitizeRelativePath(file.path));
           const ext = extname(file.path).toLowerCase();
           const binary = /\.(png|jpe?g|gif|webp|ico|bmp|woff2?|ttf|eot|mp4|mp3|zip|pdf)$/i.test(ext);
-          const content = binary ? readFileSync(full).toString('base64') : readFileSync(full, 'utf-8');
+          // Read once and hash ONLY this changed file (not the whole workspace each
+          // tick). file.hash is now empty from the walk — compute it here for the payload.
+          const buf = readFileSync(full);
+          const hash = createHash('sha256').update(buf).digest('hex');
+          const content = binary ? buf.toString('base64') : buf.toString('utf-8');
           sendEmpir3('desktop:sync:local:file', {
             projectId,
             projectName: entry.projectName || projectId,
@@ -1533,7 +1627,7 @@ function startLocalProjectSyncLoop() {
             encoding: binary ? 'base64' : 'utf-8',
             size: file.size,
             mtimeMs: file.mtimeMs,
-            hash: file.hash,
+            hash,
           });
         } catch (e: any) {
           console.log(`[Sync] Local upload skipped for ${file.path}: ${e?.message || e}`);
@@ -1549,7 +1643,11 @@ function startLocalProjectSyncLoop() {
       localSyncSeen.delete(key);
       sendEmpir3('desktop:sync:local:delete', { projectId, path });
     }
-  }, 5000);
+    // Re-walk every 30s, not 5s. Even hash-free, stat-walking a large synced
+    // workspace is a few hundred ms-to-seconds of synchronous fs work that briefly
+    // blocks the shared event loop; at 5s it kept a core ~50% busy with a stutter
+    // each tick. 30s keeps local-file sync latency fine while idling the daemon.
+  }, 30000);
 }
 
 function trimOutput(text: string): string {
@@ -2489,46 +2587,93 @@ async function startClaudeCliMcpShim(
   return startCliMcpShim('claude', id, bridgeName, tools, emit);
 }
 
-function cliContentText(content: any, omittedLabel: string): string {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  return content.map((block: any) => {
-    if (!block || typeof block !== 'object') return '';
-    if (block.type === 'text') return block.text || '';
-    if (block.type === 'image') return omittedLabel;
-    if (block.type === 'tool_result') return `[tool result] ${block.content || ''}`;
-    if (block.type === 'tool_use') return `[tool use] ${block.name || ''} ${JSON.stringify(block.input || {})}`;
-    return block.text || '';
-  }).join('\n');
+function escapeCliXml(s: string): string {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function buildClaudeCliStdin(system: string, messages: any[]): string {
-  const lines: string[] = [];
+// Build the stream-json stdin for a `claude:cli:turn`.
+//
+// Serialised as a SINGLE `user` message (mirrors the server-side local
+// ClaudeCliStrategy.buildStdin). `--input-format stream-json` only accepts
+// `user`/`control` lines — an `assistant` line is rejected ("Expected message
+// type 'user' or 'control'") and multiple `user` lines each run as a separate
+// model turn (verified 2.1.31, 2026-06-15). So prior turns are folded into a
+// `<conversation_history>` block and the current ask into `<current_request>`,
+// all inside one user message → exactly one model turn.
+//
+// Single-call vision: Claude CLI silently drops base64 image blocks fed via
+// stdin (verified 2.1.31) but reads an `@<abs-path>` reference fine. Each
+// inline image block is written to `imageTempDir` and referenced with `@<path>`
+// placed at the FRONT of the message (refs that don't lead the prompt segment
+// are skipped by the CLI's reference parser). The image thus rides the reply
+// turn instead of a separate `:see` caption pre-pass. Returns the temp dir so
+// the caller can clean it up after the child exits.
+async function buildClaudeCliStdin(system: string, messages: any[]): Promise<{ stdin: string; imageTempDir: string | null }> {
   const sys = String(system || '').trim();
-  const systemPrefix = sys
-    ? `<system_instructions>\n${sys}\n</system_instructions>\nUse these system instructions for the rest of this turn.`
-    : '';
-  let injectedSystem = false;
-  for (const message of messages) {
-    const role = message?.role === 'assistant' ? 'assistant' : 'user';
-    let text = cliContentText(message?.content, '[image attachment omitted for Claude CLI bridge route]');
-    if (systemPrefix && !injectedSystem && role === 'user') {
-      text = `${systemPrefix}\n\n${text}`;
-      injectedSystem = true;
+  let imageTempDir: string | null = null;
+  let imgIdx = 0;
+  const refs: string[] = [];
+
+  // Pull plain text from a message's content, materialising any image blocks
+  // to temp files and collecting their `@<path>` refs into `refs`.
+  const extractText = async (content: any): Promise<string> => {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    const texts: string[] = [];
+    for (const b of content) {
+      if (b && b.type === 'image' && b.source?.type === 'base64' && typeof b.source.data === 'string' && b.source.data) {
+        if (!imageTempDir) {
+          const fsp = await import('fs/promises');
+          imageTempDir = await fsp.mkdtemp(join(require('os').tmpdir(), 'empir3-cli-turn-img-'));
+        }
+        const ext = (String(b.source.media_type || 'image/png').split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '');
+        const p = join(imageTempDir, `img_${imgIdx++}.${ext}`);
+        const fsp = await import('fs/promises');
+        await fsp.writeFile(p, Buffer.from(b.source.data, 'base64'));
+        refs.push('@' + p.replace(/\\/g, '/'));
+      } else if (b && b.type === 'text' && typeof b.text === 'string' && b.text) {
+        texts.push(b.text);
+      } else if (b && b.type === 'tool_result') {
+        texts.push(`[tool result] ${b.content || ''}`);
+      } else if (b && b.type === 'tool_use') {
+        texts.push(`[tool use] ${b.name || ''} ${JSON.stringify(b.input || {})}`);
+      } else if (b && typeof b.text === 'string' && b.text) {
+        texts.push(b.text);
+      }
     }
-    if (!text.trim()) continue;
-    lines.push(JSON.stringify({
-      type: role,
-      message: { role, content: [{ type: 'text', text }] },
-    }));
+    return texts.join('\n');
+  };
+
+  // Split off the current request (last user message) from prior history.
+  let lastUserText = '';
+  const history: string[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    const role = m?.role === 'assistant' ? 'assistant' : 'user';
+    const text = await extractText(m?.content);
+    if (i === messages.length - 1 && role === 'user') {
+      lastUserText = text;
+    } else if (text.trim()) {
+      history.push(`<${role}_message>${escapeCliXml(text)}</${role}_message>`);
+    }
   }
-  if (systemPrefix && !injectedSystem) {
-    lines.unshift(JSON.stringify({
-      type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text: systemPrefix }] },
-    }));
+
+  let body = '';
+  if (sys) {
+    body += `<system_instructions>\n${sys}\n</system_instructions>\nUse these system instructions for the rest of this turn.\n\n`;
   }
-  return lines.join('\n') + '\n';
+  if (history.length > 0) {
+    body += `<conversation_history>\n${history.join('\n')}\n</conversation_history>\n\n`;
+  }
+  body += `<current_request>\n${lastUserText}\n</current_request>`;
+
+  // `@refs` lead the whole message so the CLI's reference parser sees them.
+  const finalText = refs.length ? `${refs.join(' ')}\n${body}` : body;
+  const stdin = JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'text', text: finalText }] },
+  }) + '\n';
+  return { stdin, imageTempDir };
 }
 
 async function startClaudeCliTurn(payload: any, emit: (type: string, payload: any) => void) {
@@ -2579,6 +2724,11 @@ async function startClaudeCliTurn(payload: any, emit: (type: string, payload: an
   // is empty (text-only turn) we stay on the M2.2a fast path and skip this.
   let mcpConfigPath: string | null = null;
   let mcpConfigDir: string | null = null;
+  // Single-call vision: inline image blocks in the turn payload get written
+  // to this temp dir as files the CLI reads via `@<path>` (see
+  // buildClaudeCliStdin). Cleaned in the child `close` handler.
+  let imageTempDir: string | null = null;
+  let stdinPayload = '';
   const turnTools = Array.isArray(payload?.tools) ? payload.tools : [];
   const bridgeName = String(payload?.bridge_name || 'empir3').replace(/[^A-Za-z0-9_-]/g, '') || 'empir3';
   if (turnTools.length > 0) {
@@ -2625,6 +2775,22 @@ async function startClaudeCliTurn(payload: any, emit: (type: string, payload: an
     turnEnv.MCP_TOOL_TIMEOUT = String(MCP_TOOL_CALL_TIMEOUT_MS);
   }
 
+  // Build the stream-json stdin up-front. This writes any inline image blocks
+  // to a temp dir and rewrites them as `@<path>` refs — done before spawn so a
+  // write failure never leaves an orphaned child waiting on stdin.
+  try {
+    const built = await buildClaudeCliStdin(String(payload?.system || ''), messages);
+    stdinPayload = built.stdin;
+    imageTempDir = built.imageTempDir;
+  } catch (e: any) {
+    if (mcpConfigDir) {
+      try { require('fs').rmSync(mcpConfigDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+    teardownClaudeCliMcpShim(id);
+    emit('claude:cli:error', { id, stage: 'build_stdin', error: e?.message || String(e) });
+    return { success: false, id, error: e?.message || String(e) };
+  }
+
   let child: ChildProcess;
   try {
     child = spawnCli(command, args, {
@@ -2635,6 +2801,9 @@ async function startClaudeCliTurn(payload: any, emit: (type: string, payload: an
   } catch (e: any) {
     if (mcpConfigDir) {
       try { require('fs').rmSync(mcpConfigDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+    if (imageTempDir) {
+      try { require('fs').rmSync(imageTempDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
     teardownClaudeCliMcpShim(id);
     emit('claude:cli:error', { id, stage: 'spawn', error: e?.message || String(e) });
@@ -2683,6 +2852,10 @@ async function startClaudeCliTurn(payload: any, emit: (type: string, payload: an
       mcpConfigDir = null;
       mcpConfigPath = null;
     }
+    if (imageTempDir) {
+      try { require('fs').rmSync(imageTempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      imageTempDir = null;
+    }
     const duration_ms = Date.now() - startedAt;
     if (timedOut) {
       emit('claude:cli:error', {
@@ -2709,7 +2882,7 @@ async function startClaudeCliTurn(payload: any, emit: (type: string, payload: an
   });
 
   try {
-    child.stdin?.write(buildClaudeCliStdin(String(payload?.system || ''), messages));
+    child.stdin?.write(stdinPayload);
     child.stdin?.end();
   } catch (e: any) {
     emit('claude:cli:error', { id, stage: 'stdin', error: e?.message || String(e) });
@@ -3752,11 +3925,47 @@ function codexMessageText(message: any): string {
   return content.map((block: any) => {
     if (!block || typeof block !== 'object') return '';
     if (block.type === 'text') return block.text || '';
-    if (block.type === 'image') return '[image attachment omitted for Codex CLI bridge route]';
+    // Image blocks carry no text — single-call vision delivers them out-of-band
+    // (codex via `--image <file>`, gemini/agy via a `@<path>` ref on the prompt;
+    // see materializeTurnImages). Drop them here so they don't leave a stray
+    // "[image omitted]" line that contradicts the image the model actually got.
+    if (block.type === 'image') return '';
     if (block.type === 'tool_result') return `[tool result] ${block.content || ''}`;
     if (block.type === 'tool_use') return `[tool use] ${block.name || ''} ${JSON.stringify(block.input || {})}`;
     return block.text || '';
-  }).join('\n');
+  }).filter(Boolean).join('\n');
+}
+
+// Materialise inline image content blocks from turn messages to temp files the
+// lent CLI can read, returning `@<abs-path>` refs + the temp dir to clean up.
+// Single-call vision: the image rides the reply turn instead of a separate
+// `:see` caption pre-pass. (Claude has its own materialiser inside
+// buildClaudeCliStdin; this one serves the codex / gemini / agy turn handlers.)
+// Forward-slash absolute paths — the CLIs' @-ref parsers want them.
+async function materializeTurnImages(messages: any[]): Promise<{ refs: string[]; absPaths: string[]; tempDir: string | null }> {
+  let tempDir: string | null = null;
+  let idx = 0;
+  const refs: string[] = [];
+  const absPaths: string[] = [];
+  for (const m of messages) {
+    if (!Array.isArray(m?.content)) continue;
+    for (const b of m.content) {
+      if (b && b.type === 'image' && b.source?.type === 'base64' && typeof b.source.data === 'string' && b.source.data) {
+        if (!tempDir) {
+          const fsp = await import('fs/promises');
+          tempDir = await fsp.mkdtemp(join(require('os').tmpdir(), 'empir3-cli-turn-img-'));
+        }
+        const ext = (String(b.source.media_type || 'image/png').split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '');
+        const p = join(tempDir, `img_${idx++}.${ext}`);
+        const fsp = await import('fs/promises');
+        await fsp.writeFile(p, Buffer.from(b.source.data, 'base64'));
+        const abs = p.replace(/\\/g, '/');
+        absPaths.push(abs);
+        refs.push('@' + abs);
+      }
+    }
+  }
+  return { refs, absPaths, tempDir };
 }
 
 function buildCodexBridgePrompt(system: string, messages: any[]): string {
@@ -3809,6 +4018,10 @@ async function startCodexCliTurn(payload: any, emit: (type: string, payload: any
 
   const model = String(payload?.model || 'gpt-5.4');
   const prompt = buildCodexBridgePrompt(String(payload?.system || ''), messages);
+  // Single-call vision: inline images become `--image <file>` flags (Codex's
+  // native image input; verified the flag does not consume the trailing stdin
+  // `-`). Temp dir cleaned in the close handler.
+  const { absPaths: imageAbsPaths, tempDir: imageTempDir } = await materializeTurnImages(messages);
   const turnTools = Array.isArray(payload?.tools) ? payload.tools : [];
   const bridgeName = String(payload?.bridge_name || 'empir3').replace(/[^A-Za-z0-9_-]/g, '') || 'empir3';
   let mcpShim: CliMcpShim | null = null;
@@ -3850,6 +4063,8 @@ async function startCodexCliTurn(payload: any, emit: (type: string, payload: any
       if (typeof arg === 'string' && arg.trim()) args.push(arg);
     }
   }
+  // `--image <file>` per inlined image, before the trailing `-` (stdin prompt).
+  for (const abs of imageAbsPaths) args.push('--image', abs);
   args.push('-');
 
   const useShell = process.platform === 'win32' && command.toLowerCase().endsWith('.cmd');
@@ -3863,6 +4078,7 @@ async function startCodexCliTurn(payload: any, emit: (type: string, payload: any
     });
   } catch (e: any) {
     teardownCliMcpShim(id);
+    if (imageTempDir) { try { require('fs').rmSync(imageTempDir, { recursive: true, force: true }); } catch { /* ignore */ } }
     emit('codex:cli:error', { id, stage: 'spawn', error: e?.message || String(e) });
     return { success: false, id, error: e?.message || String(e) };
   }
@@ -3906,6 +4122,7 @@ async function startCodexCliTurn(payload: any, emit: (type: string, payload: any
     activeCodexCliRuns.delete(id);
     if (lineBuffer.trim()) emit('codex:cli:chunk', { id, seq: seq++, data: lineBuffer });
     teardownCliMcpShim(id);
+    if (imageTempDir) { try { require('fs').rmSync(imageTempDir, { recursive: true, force: true }); } catch { /* ignore */ } }
     const duration_ms = Date.now() - startedAt;
     if (timedOut) {
       emit('codex:cli:error', {
@@ -4032,6 +4249,7 @@ async function runCliSee(
   const errType = `${spec.wirePrefix}:cli:see:error`;
   const doneType = `${spec.wirePrefix}:cli:see:done`;
   const id = String(payload?.id || `${spec.wirePrefix}-see-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const receivedAt = Date.now();
 
   if (!spec.optedInCheck()) {
     emit(errType, { id, stage: 'declined', error: spec.optedOutMessage });
@@ -4052,8 +4270,10 @@ async function runCliSee(
     return { success: false, id, error: 'prompt required' };
   }
 
+  const resolveStartedAt = Date.now();
   let command = await findPreferredExecutable(spec.cliName);
   if (!command && spec.fallbackBinPath) command = spec.fallbackBinPath();
+  const resolvedAt = Date.now();
   if (!command) {
     emit(errType, { id, stage: 'spawn', error: `${spec.cliName} CLI not found on PATH` });
     return { success: false, id, error: `${spec.cliName} CLI not found` };
@@ -4063,6 +4283,7 @@ async function runCliSee(
   const osm = await import('os');
   const tempDir = await fsp.mkdtemp(join(osm.tmpdir(), `empir3-${spec.wirePrefix}-see-`));
 
+  const buildStartedAt = Date.now();
   let invocation: { args: string[]; cwd?: string; env?: NodeJS.ProcessEnv; stdin?: string; parseText: (stdout: string) => string };
   try {
     invocation = await spec.buildInvocation({ prompt, system, imageBase64, mimeType, model, tempDir });
@@ -4071,6 +4292,7 @@ async function runCliSee(
     emit(errType, { id, stage: 'build_invocation', error: e?.message || String(e) });
     return { success: false, id, error: e?.message || String(e) };
   }
+  const builtAt = Date.now();
 
   // Default 120s — CLI cold-start on Windows + image upload + vision
   // model reasoning can run 15-30s under load. Caller-side timeouts
@@ -4083,10 +4305,18 @@ async function runCliSee(
 
   let child: ChildProcess;
   try {
+    // stdin = 'ignore' (NUL) unless this invocation actually feeds stdin.
+    // ROOT CAUSE of the daemon-only :see hang: claude `--print` in TEXT mode
+    // reads stdin and waits for EOF. With a piped stdin, our `child.stdin.end()`
+    // delivers that EOF instantly in a quiet process, but under the busy daemon
+    // event loop the EOF was delayed indefinitely → claude blocked the full
+    // timeout (verified 2026-06-06: piped-no-EOF HANGs >45s, 'ignore' completes
+    // in ~11s). A null stdin gives immediate EOF, so the CLI never waits.
+    const stdinMode: 'ignore' | 'pipe' = invocation.stdin ? 'pipe' : 'ignore';
     child = spawnCli(command, invocation.args, {
       env: { ...process.env, ...(invocation.env ?? {}) },
       cwd: invocation.cwd ?? process.cwd(),
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: [stdinMode, 'pipe', 'pipe'],
     });
   } catch (e: any) {
     try { await fsp.rm(tempDir, { recursive: true, force: true }); } catch {}
@@ -4128,7 +4358,20 @@ async function runCliSee(
       emit(errType, { id, stage: 'parse', exit_code: code ?? -1, duration_ms, error: e?.message || String(e), stderr_tail: stderrTail.slice(-512) });
       return;
     }
-    emit(doneType, { id, text, exit_code: code ?? 0, duration_ms, stderr_tail: stderrTail.slice(-512) });
+    emit(doneType, {
+      id,
+      text,
+      exit_code: code ?? 0,
+      duration_ms,
+      total_ms: Date.now() - receivedAt,
+      stage_ms: {
+        precheck: resolveStartedAt - receivedAt,
+        resolve: resolvedAt - resolveStartedAt,
+        build: builtAt - buildStartedAt,
+        spawn_to_close: duration_ms,
+      },
+      stderr_tail: stderrTail.slice(-512),
+    });
   });
 
   child.on('error', (e: Error) => {
@@ -4170,11 +4413,37 @@ async function runClaudeCliSee(payload: any, emit: (type: string, payload: any) 
       const imageName = `image.${ext}`;
       const imagePath = join(tempDir, imageName);
       await fsp.writeFile(imagePath, Buffer.from(imageBase64, 'base64'));
-      const fullPrompt = `@${imageName} ${prompt}`;
-      const args = ['--print', '--permission-mode', 'bypassPermissions'];
-      if (model) args.push('--model', model);
-      if (system) args.push('--system-prompt', system);
-      args.push(fullPrompt);
+      // Use the ABSOLUTE path in the @<ref>. A bare relative `@image.png`
+      // (with cwd=tempDir) silently fails to attach on Claude CLI 2.1.31 —
+      // the model replies "I can't load the image" and the see call stalls to
+      // the watchdog. An absolute forward-slash path resolves reliably
+      // (verified 2026-06-06 against 2.1.31). Keep the @ref on the FIRST line.
+      const imageRef = imagePath.replace(/\\/g, '/');
+      // Use the PROVEN-WORKING bare invocation. The richer flag set
+      // (`--permission-mode bypassPermissions` + `--system-prompt` + `--model`)
+      // HANGS the entire timeout when claude is spawned by the busy daemon —
+      // confirmed across 0.3.5–0.3.7, and the hang predates --strict-mcp-config
+      // so that's not the cause. The bare `claude -p "@<img> <instruction>"`
+      // returns a correct description through the SAME daemon (verified
+      // 2026-06-06 via cli_run, ~29s). So: fold the system instruction into the
+      // prompt text right after the @ref (which MUST stay on the first line),
+      // drop the permission/system/model flags, and keep only
+      // --strict-mcp-config to skip the ~10s MCP startup tax. The admin's
+      // per-call model isn't passed here — the CLI default is correct for a
+      // one-shot caption and is the path that actually completes.
+      const instruction = system ? `${system} ` : '';
+      const fullPrompt = `@${imageRef} ${instruction}${prompt}`;
+      // Based on the proven `claude -p "<prompt>"` invocation that completes in
+      // the daemon (cli_run, verified), plus --strict-mcp-config. The latter is
+      // the big speed lever: without it, every call loads the device owner's
+      // global MCP servers — including `empir3-bridge`, which is a full
+      // `Empir3Setup.exe --mcp` spawn — adding tens of seconds to a cold call
+      // (measured 89s cold with MCP). A one-shot image describe needs zero
+      // tools, so skip them. This is NOT the hang cause (the hang was
+      // --permission-mode bypassPermissions + --system-prompt, both dropped);
+      // if a CLI ever did hang, the 120s watchdog + fail-loud path catches it.
+      const args = ['-p', '--strict-mcp-config', fullPrompt];
+      void model;
       // Claude OAuth path — scrub env keys (mirrors startClaudeCliTurn).
       const env = claudeCliEnv();
       return {
@@ -4250,9 +4519,12 @@ async function runAgyCliSee(payload: any, emit: (type: string, payload: any) => 
       const imageName = `image.${ext}`;
       const imagePath = join(tempDir, imageName);
       await fsp.writeFile(imagePath, Buffer.from(imageBase64, 'base64'));
+      // Absolute @ref — relative `@image.png` is unreliable on the current
+      // CLI generation (see runClaudeCliSee note). Forward-slash, first line.
+      const imageRef = imagePath.replace(/\\/g, '/');
       const fullPrompt = system
-        ? `@${imageName} ${prompt}\n\n${system}`
-        : `@${imageName} ${prompt}`;
+        ? `@${imageRef} ${prompt}\n\n${system}`
+        : `@${imageRef} ${prompt}`;
       // agy's --help shows no --model flag at top level. Pass the prompt
       // alone; if agy adds model selection in a later release, push
       // ['--model', model] back in here. The `model` parameter is still
@@ -4281,14 +4553,15 @@ async function runGeminiCliSee(payload: any, emit: (type: string, payload: any) 
       const imageName = `image.${ext}`;
       const imagePath = join(tempDir, imageName);
       await fsp.writeFile(imagePath, Buffer.from(imageBase64, 'base64'));
-      // Gemini's @<path> file-reference syntax. The path is relative
-      // to cwd (the temp dir) so a bare filename works. Like Claude,
-      // keep @<path> on the first line — same parser sensitivity.
+      // Gemini's @<path> file-reference syntax. Use the ABSOLUTE path —
+      // a bare relative filename is unreliable on the current CLI
+      // generation (see runClaudeCliSee note). Forward-slash, first line.
       // Gemini doesn't have a separate --system-prompt flag, so
       // system intent is folded after the @ ref + user prompt.
+      const imageRef = imagePath.replace(/\\/g, '/');
       const fullPrompt = system
-        ? `@${imageName} ${prompt}\n\n${system}`
-        : `@${imageName} ${prompt}`;
+        ? `@${imageRef} ${prompt}\n\n${system}`
+        : `@${imageRef} ${prompt}`;
       const args = ['-y', '--skip-trust', '-p', fullPrompt];
       if (model) args.push('--model', model);
       return {
@@ -4465,6 +4738,11 @@ async function startPlainCliTurn(payload: any, emit: (type: string, payload: any
 
   const model = typeof payload?.model === 'string' ? payload.model : '';
   const prompt = buildPlainCliPrompt(String(payload?.system || ''), messages, turnTools);
+  // Single-call vision: inline images become `@<path>` refs that LEAD the CLI's
+  // -p value (verified — gemini reads the image from the -p value while the
+  // real conversation streams on stdin). Temp dir cleaned in cleanupMcp.
+  const { refs: imageRefs, tempDir: imageTempDir } = await materializeTurnImages(messages);
+  const imageRefPrefix = imageRefs.length ? `${imageRefs.join(' ')} ` : '';
   const args = [...spec.baseArgs];
   const promptTransport = spec.promptTransport || { mode: 'argv' as const, placement: 'end' as const };
   let promptAttached = false;
@@ -4474,7 +4752,13 @@ async function startPlainCliTurn(payload: any, emit: (type: string, payload: any
     if (promptAttached) return;
     promptAttached = true;
     if (promptTransport.mode === 'stdin') {
-      args.push(...promptTransport.args);
+      // Lead the -p hint value with image refs so the CLI sees the image; the
+      // real conversation still streams on stdin.
+      const stdinArgs = [...promptTransport.args];
+      if (imageRefPrefix && stdinArgs.length > 0) {
+        stdinArgs[stdinArgs.length - 1] = `${imageRefPrefix}${stdinArgs[stdinArgs.length - 1]}`;
+      }
+      args.push(...stdinArgs);
       stdinPrompt = prompt;
       return;
     }
@@ -4491,7 +4775,7 @@ async function startPlainCliTurn(payload: any, emit: (type: string, payload: any
       };
       return;
     }
-    args.push(prompt);
+    args.push(`${imageRefPrefix}${prompt}`);
   };
   try {
     if (promptTransport.placement === 'afterBaseArgs') await attachPrompt();
@@ -4527,6 +4811,9 @@ async function startPlainCliTurn(payload: any, emit: (type: string, payload: any
     if (cleanupPromptFile) {
       try { await cleanupPromptFile(); } catch (e) { console.warn(`[plain-cli ${spec.wirePrefix}] prompt cleanup failed:`, e); }
       cleanupPromptFile = null;
+    }
+    if (imageTempDir) {
+      try { const fsp = await import('fs/promises'); await fsp.rm(imageTempDir, { recursive: true, force: true }); } catch (e) { console.warn(`[plain-cli ${spec.wirePrefix}] image cleanup failed:`, e); }
     }
     if (mcpHandle) {
       try { await mcpHandle.cleanup(); } catch (e) { console.warn(`[plain-cli ${spec.wirePrefix}] mcp cleanup failed:`, e); }
@@ -4673,9 +4960,9 @@ function killPtyProcess(proc: IPty, signal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM') {
   } catch {}
 }
 
-async function appendPtyPromptArg(args: string[], prompt: string, spec: PtyCliTurnSpec, preferredDir?: string): Promise<() => Promise<void>> {
+async function appendPtyPromptArg(args: string[], prompt: string, spec: PtyCliTurnSpec, preferredDir?: string, imageRefPrefix = ''): Promise<() => Promise<void>> {
   if (!spec.promptFile) {
-    args.push(prompt);
+    args.push(`${imageRefPrefix}${prompt}`);
     return async () => {};
   }
 
@@ -4686,7 +4973,10 @@ async function appendPtyPromptArg(args: string[], prompt: string, spec: PtyCliTu
   const filename = (spec.promptFile.filename || 'prompt.txt').replace(/[^A-Za-z0-9._-]/g, '_') || 'prompt.txt';
   const promptPath = join(dir, filename);
   await fsp.writeFile(promptPath, prompt, 'utf-8');
-  args.push(`${spec.promptFile.prefix ?? ''}${promptPath}`);
+  // Single-call vision: image `@<path>` refs lead the -p value so the CLI sees
+  // them, e.g. `-p "@<img> @<promptfile>"`. Same @-ref mechanism agy's :see
+  // path uses (and identical to the verified gemini route).
+  args.push(`${imageRefPrefix}${spec.promptFile.prefix ?? ''}${promptPath}`);
 
   return async () => {
     try {
@@ -4743,11 +5033,15 @@ async function startPtyCliTurn(payload: any, emit: (type: string, payload: any) 
 
   const model = typeof payload?.model === 'string' ? payload.model : '';
   const prompt = buildPlainCliPrompt(String(payload?.system || ''), messages, turnTools);
+  // Single-call vision: inline images become `@<path>` refs leading the -p
+  // value (see appendPtyPromptArg). Temp dir cleaned in cleanupTurnResources.
+  const { refs: imageRefs, tempDir: imageTempDir } = await materializeTurnImages(messages);
+  const imageRefPrefix = imageRefs.length ? `${imageRefs.join(' ')} ` : '';
   const args = [...spec.baseArgs];
   let cleanupPromptArg: (() => Promise<void>) | null = null;
   const appendPromptArg = async () => {
     if (cleanupPromptArg) return;
-    cleanupPromptArg = await appendPtyPromptArg(args, prompt, spec, mcpHandle?.cwd);
+    cleanupPromptArg = await appendPtyPromptArg(args, prompt, spec, mcpHandle?.cwd, imageRefPrefix);
   };
   try {
     if (spec.promptPlacement === 'afterBaseArgs') await appendPromptArg();
@@ -4783,6 +5077,9 @@ async function startPtyCliTurn(payload: any, emit: (type: string, payload: any) 
     if (cleanupPromptArg) {
       try { await cleanupPromptArg(); } catch (e) { console.warn(`[pty-cli ${spec.wirePrefix}] prompt cleanup failed:`, e); }
       cleanupPromptArg = null;
+    }
+    if (imageTempDir) {
+      try { const fsp = await import('fs/promises'); await fsp.rm(imageTempDir, { recursive: true, force: true }); } catch (e) { console.warn(`[pty-cli ${spec.wirePrefix}] image cleanup failed:`, e); }
     }
     if (mcpHandle) {
       try { await mcpHandle.cleanup(); } catch (e) { console.warn(`[pty-cli ${spec.wirePrefix}] mcp cleanup failed:`, e); }
@@ -6014,13 +6311,20 @@ function listRecordings() {
 async function handleAgentBrowser(action: string, params: any) {
   switch (action) {
     case 'show': {
-      const showRes = await cdpPost('/show', { url: params?.url || '' });
+      let showRes: any = null;
+      let warning: string | undefined;
+      try {
+        showRes = await cdpPost('/show', { url: params?.url || '' }, { timeoutMs: 8000, wakeOnNotReady: false });
+      } catch (e: any) {
+        warning = `Open Bridge requested, but CDP is still starting: ${e?.message || e}`;
+        console.warn(`[Bridge] ${warning}`);
+      }
       const href = showRes?.url || `${BRIDGE_URL}/welcome`;
       currentUrl = href;
       sessionCtx.currentUrl = currentUrl;
       if (!sessionCtx.pages.includes(currentUrl)) sessionCtx.pages.push(currentUrl);
       saveSessionContext();
-      return { success: true, shown: true, url: href };
+      return { success: true, shown: true, url: href, warning };
     }
     case 'open':
     case 'navigate':
@@ -6198,7 +6502,7 @@ function handleEmpir3Message(msg: any) {
 
   if (typeof type === 'string' && type.startsWith('claude:cli:')) {
     const action = type.slice('claude:cli:'.length);
-    if (!hasEmpir3Permission('execute')) {
+    if (!READ_ONLY_CLI_ACTIONS.has(action) && !hasEmpir3Permission('execute')) {
       sendEmpir3('claude:cli:error', {
         id: payload?.id || '',
         stage: action || 'unknown',
@@ -6220,7 +6524,7 @@ function handleEmpir3Message(msg: any) {
 
   if (typeof type === 'string' && type.startsWith('codex:cli:')) {
     const action = type.slice('codex:cli:'.length);
-    if (!hasEmpir3Permission('execute')) {
+    if (!READ_ONLY_CLI_ACTIONS.has(action) && !hasEmpir3Permission('execute')) {
       sendEmpir3('codex:cli:error', {
         id: payload?.id || '',
         stage: action || 'unknown',
@@ -6242,7 +6546,7 @@ function handleEmpir3Message(msg: any) {
 
   if (typeof type === 'string' && type.startsWith('gemini:cli:')) {
     const action = type.slice('gemini:cli:'.length);
-    if (!hasEmpir3Permission('execute')) {
+    if (!READ_ONLY_CLI_ACTIONS.has(action) && !hasEmpir3Permission('execute')) {
       sendEmpir3('gemini:cli:error', {
         id: payload?.id || '',
         stage: action || 'unknown',
@@ -6264,7 +6568,7 @@ function handleEmpir3Message(msg: any) {
 
   if (typeof type === 'string' && type.startsWith('grok:cli:')) {
     const action = type.slice('grok:cli:'.length);
-    if (!hasEmpir3Permission('execute')) {
+    if (!READ_ONLY_CLI_ACTIONS.has(action) && !hasEmpir3Permission('execute')) {
       sendEmpir3('grok:cli:error', {
         id: payload?.id || '',
         stage: action || 'unknown',
@@ -6286,7 +6590,7 @@ function handleEmpir3Message(msg: any) {
 
   if (typeof type === 'string' && type.startsWith('agy:cli:')) {
     const action = type.slice('agy:cli:'.length);
-    if (!hasEmpir3Permission('execute')) {
+    if (!READ_ONLY_CLI_ACTIONS.has(action) && !hasEmpir3Permission('execute')) {
       sendEmpir3('agy:cli:error', {
         id: payload?.id || '',
         stage: action || 'unknown',
@@ -6315,7 +6619,7 @@ function handleEmpir3Message(msg: any) {
   // the server reported "upstream returned no video".
   if (typeof type === 'string' && type.startsWith('higgsfield:cli:')) {
     const action = type.slice('higgsfield:cli:'.length);
-    if (!hasEmpir3Permission('execute')) {
+    if (!READ_ONLY_CLI_ACTIONS.has(action) && !hasEmpir3Permission('execute')) {
       sendEmpir3('higgsfield:cli:error', {
         id: payload?.id || '',
         stage: action || 'unknown',
@@ -6627,33 +6931,69 @@ function isBridgeNotReadyError(text: string): boolean {
   return /Not connected|CDP not connected|Browser WS not connected/i.test(text);
 }
 
+function updateCdpReachabilityFromBody(path: string, body: any): void {
+  bridgeReachable = true;
+  if (path === '/health') {
+    cdpConnected = body?.status === 'connected';
+    return;
+  }
+  if (body && typeof body === 'object' && (body.closedByUser || body.chrome === 'exited' || body.chrome === 'not-started')) {
+    cdpConnected = false;
+    return;
+  }
+  cdpConnected = true;
+}
+
 async function wakeBridgeBrowser(): Promise<void> {
   try {
-    await fetch(`${BRIDGE_URL}/show`, {
+    await fetchWithTimeout(`${BRIDGE_URL}/show`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
-    });
+    }, 5000);
   } catch {}
   await wait(750);
 }
 
-async function cdpGet(path: string, params?: Record<string, string>): Promise<any> {
+async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 5000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: init.signal || controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function cdpGet(path: string, params?: Record<string, string>, opts: { timeoutMs?: number } = {}): Promise<any> {
   let url = `${BRIDGE_URL}${path}`;
   if (params) {
     const qs = new URLSearchParams(params).toString();
     url += `?${qs}`;
   }
   for (let attempt = 0; attempt < 3; attempt++) {
-    const res = await fetch(url, { headers: { 'Content-Type': 'application/json' } });
-    if (res.ok) {
-      if (path !== '/health') {
-        bridgeReachable = true;
-        cdpConnected = true;
+    let res: Response;
+    try {
+      res = await fetchWithTimeout(url, { headers: { 'Content-Type': 'application/json' } }, opts.timeoutMs || 5000);
+    } catch (e: any) {
+      if (attempt < 2) {
+        await wait(250);
+        continue;
       }
+      bridgeReachable = false;
+      cdpConnected = false;
+      throw new Error(`Empir3 Bridge ${path}: ${e?.name === 'AbortError' ? 'timeout' : (e?.message || e)}`);
+    }
+    if (res.ok) {
       const ct = res.headers.get('content-type') || '';
-      if (ct.includes('json')) return res.json();
-      return res.text();
+      if (ct.includes('json')) {
+        const body = await res.json();
+        updateCdpReachabilityFromBody(path, body);
+        return body;
+      }
+      const body = await res.text();
+      updateCdpReachabilityFromBody(path, body);
+      return body;
     }
     const text = await res.text();
     if (attempt < 2 && isBridgeNotReadyError(text)) {
@@ -6665,18 +7005,29 @@ async function cdpGet(path: string, params?: Record<string, string>): Promise<an
   throw new Error(`Empir3 Bridge ${path}: exhausted retries`);
 }
 
-async function cdpGetRaw(path: string, params?: Record<string, string>): Promise<Buffer> {
+async function cdpGetRaw(path: string, params?: Record<string, string>, opts: { timeoutMs?: number } = {}): Promise<Buffer> {
   let url = `${BRIDGE_URL}${path}`;
   if (params) {
     const qs = new URLSearchParams(params).toString();
     url += `?${qs}`;
   }
   for (let attempt = 0; attempt < 3; attempt++) {
-    const res = await fetch(url);
+    let res: Response;
+    try {
+      res = await fetchWithTimeout(url, {}, opts.timeoutMs || 8000);
+    } catch (e: any) {
+      if (attempt < 2) {
+        await wait(250);
+        continue;
+      }
+      bridgeReachable = false;
+      cdpConnected = false;
+      throw new Error(`Empir3 Bridge ${path}: ${e?.name === 'AbortError' ? 'timeout' : (e?.message || e)}`);
+    }
     if (res.ok) {
+      const ab = await res.arrayBuffer();
       bridgeReachable = true;
       cdpConnected = true;
-      const ab = await res.arrayBuffer();
       return Buffer.from(ab);
     }
     const text = await res.text().catch(() => '');
@@ -6711,9 +7062,10 @@ async function cdpPost(path: string, data: any, opts: { wakeOnNotReady?: boolean
       if (timer) clearTimeout(timer);
     }
     if (res.ok) {
-      bridgeReachable = true;
-      cdpConnected = true;
-      try { return await res.json(); } catch { return { success: true }; }
+      let body: any = { success: true };
+      try { body = await res.json(); } catch {}
+      updateCdpReachabilityFromBody(path, body);
+      return body;
     }
     const text = await res.text();
     if (wakeOnNotReady && attempt < 2 && isBridgeNotReadyError(text)) {
@@ -11673,6 +12025,8 @@ const httpServer = createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/settings/state') {
     try {
+      // Explicit "Re-scan" forces a fresh CLI probe; routine polls use the cache.
+      if (url.searchParams.get('fresh') === '1') invalidateCliProbeCache();
       const state = await buildSettingsState();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(state));
@@ -12175,7 +12529,8 @@ wss.on('connection', (ws, req) => {
       ws.send(JSON.stringify({ type: 'recording_action', count: recordingActions.length, action: 'sync' }));
     }
     if (isPlaying) {
-      ws.send(JSON.stringify({ type: 'playback_state', playing: true, name: '', total: 0 }));
+      ws.send(JSON.stringify({ type: 'playback_state', playing: true, name: playbackControl.name, total: playbackControl.total }));
+      ws.send(JSON.stringify(transportSnapshot()));
     }
   }
 });
@@ -12203,6 +12558,14 @@ async function handleOverlayMessage(msg: any, ws: WebSocket) {
       target: resolved,
       state,
     }));
+    // Sync active playback to a freshly-announced overlay. Covers CDP-mailbox
+    // overlays on https (which never hit the WS 'connection' handler) and any
+    // overlay re-injected after a navigation mid-replay — both otherwise miss
+    // the one-time playback_state broadcast and never show the transport bar.
+    if (isPlaying) {
+      ws.send(JSON.stringify({ type: 'playback_state', playing: true, name: playbackControl.name, total: playbackControl.total }));
+      ws.send(JSON.stringify(transportSnapshot()));
+    }
     return;
   }
 
@@ -12493,7 +12856,7 @@ async function executeCommand(cmd: BridgeCommand, source = 'direct'): Promise<an
     return executeRelayStyleDesktopCommand(relayStyleDesktopCommand);
   }
 
-  const browserFreeCommands = new Set(['status', 'read_chat', 'recordings', 'desktop_monitors', 'desktop_screenshot', 'desktop_screenshot_zoom', 'desktop_click', 'desktop_hover', 'desktop_drag', 'desktop_cursor_position', 'desktop_screen_size', 'desktop_snapshot', 'desktop_snapshot_som', 'desktop_click_ref', 'desktop_hover_ref', 'desktop_overlay', 'desktop_select_region', 'desktop_release_focus', 'desktop_focus_status', 'desktop_pointer_show', 'desktop_pointer_move', 'desktop_pointer_pulse', 'desktop_pointer_hide', 'desktop_pointer_status', 'desktop_calibrate_pointer', 'desktop_calibration_status', 'desktop_click_cell', 'desktop_pointer_cell', 'desktop_focus_grid', 'desktop_pick_point', 'desktop_toolbar', 'bridge_tool_advisor', 'bridge_setup_status', 'bridge_setup_save', 'overlay_reinject', 'bridge_overlay_reinject', 'action_log', 'reliability_status', 'reliability_smoke', 'safety_status', 'safety_lockdown', 'higgsfield_status', 'higgsfield_list', 'higgsfield_generate', 'custom_llm', 'github_status', 'github:exec']);
+  const browserFreeCommands = new Set(['status', 'read_chat', 'recordings', 'playback_pause', 'playback_resume', 'playback_stop', 'playback_step', 'playback_speed', 'playback_seek', 'desktop_monitors', 'desktop_screenshot', 'desktop_screenshot_zoom', 'desktop_click', 'desktop_hover', 'desktop_drag', 'desktop_cursor_position', 'desktop_screen_size', 'desktop_snapshot', 'desktop_snapshot_som', 'desktop_click_ref', 'desktop_hover_ref', 'desktop_overlay', 'desktop_select_region', 'desktop_release_focus', 'desktop_focus_status', 'desktop_pointer_show', 'desktop_pointer_move', 'desktop_pointer_pulse', 'desktop_pointer_hide', 'desktop_pointer_status', 'desktop_calibrate_pointer', 'desktop_calibration_status', 'desktop_click_cell', 'desktop_pointer_cell', 'desktop_focus_grid', 'desktop_pick_point', 'desktop_toolbar', 'bridge_tool_advisor', 'bridge_setup_status', 'bridge_setup_save', 'overlay_reinject', 'bridge_overlay_reinject', 'action_log', 'reliability_status', 'reliability_smoke', 'safety_status', 'safety_lockdown', 'higgsfield_status', 'higgsfield_list', 'higgsfield_generate', 'custom_llm', 'github_status', 'github:exec']);
   if (!browserFreeCommands.has(cmd.type) && !cdpConnected) {
     const ok = await checkBridgeHealth();
     if (!ok) throw new Error('Empir3 Bridge not connected. Start empir3-bridge first, or use --launch flag.');
@@ -12623,14 +12986,25 @@ async function executeCommand(cmd: BridgeCommand, source = 'direct'): Promise<an
     }
 
     case 'desktop:browse:show': {
-      const showRes = await cdpPost('/show', { url: cmd.url || '' });
+      let showRes: any = null;
+      let warning: string | undefined;
+      try {
+        showRes = await cdpPost('/show', { url: cmd.url || '' }, { timeoutMs: 8000, wakeOnNotReady: false });
+      } catch (e: any) {
+        warning = `Open Bridge requested, but CDP is still starting: ${e?.message || e}`;
+        console.warn(`[Bridge] ${warning}`);
+      }
       const href = showRes?.url || `${BRIDGE_URL}/welcome`;
       currentUrl = href;
       sessionCtx.currentUrl = currentUrl;
       if (!sessionCtx.pages.includes(currentUrl)) sessionCtx.pages.push(currentUrl);
       saveSessionContext();
-      try { await browserTabState(); await broadcastBrowserTabState(); } catch {}
-      return { shown: true, url: href };
+      setTimeout(() => {
+        browserTabState()
+          .then(() => broadcastBrowserTabState())
+          .catch(() => {});
+      }, 0);
+      return { shown: true, url: href, warning };
     }
 
     case 'click': {
@@ -13132,6 +13506,46 @@ async function executeCommand(cmd: BridgeCommand, source = 'direct'): Promise<an
     case 'play':
       return await playRecording(cmd.recording!, cmd.speed || 1, cmd.variables || {});
 
+    case 'playback_pause':
+      if (!isPlaying) return { ok: false, error: 'No recording is playing' };
+      playbackControl.paused = true;
+      broadcastToOverlay(transportSnapshot());
+      return { ok: true, paused: true };
+
+    case 'playback_resume':
+      if (!isPlaying) return { ok: false, error: 'No recording is playing' };
+      playbackControl.paused = false;
+      playbackControl.stepOnce = false;
+      broadcastToOverlay(transportSnapshot());
+      return { ok: true, paused: false };
+
+    case 'playback_stop':
+      if (!isPlaying) return { ok: false, error: 'No recording is playing' };
+      playbackControl.stop = true;
+      playbackControl.paused = false;  // unblock the pause gate so the loop sees the stop
+      return { ok: true, stopped: true };
+
+    case 'playback_step':
+      if (!isPlaying) return { ok: false, error: 'No recording is playing' };
+      playbackControl.stepOnce = true;  // pause gate releases for one action, then re-pauses
+      return { ok: true, stepped: true };
+
+    case 'playback_speed': {
+      const sp = Math.max(0.1, Math.min(10, Number(cmd.speed) || 1));
+      playbackControl.speed = sp;
+      if (isPlaying) broadcastToOverlay(transportSnapshot());
+      return { ok: true, speed: sp };
+    }
+
+    case 'playback_seek': {
+      if (!isPlaying) return { ok: false, error: 'No recording is playing' };
+      const target = Math.max(0, Math.min((playbackControl.total || 1) - 1, Math.floor(Number(cmd.step) || 0)));
+      playbackControl.seekTo = target;
+      playbackControl.paused = false;   // unblock the pause gate so the loop performs the seek
+      playbackControl.stepOnce = false;
+      return { ok: true, seekTo: target };
+    }
+
     case 'delete_recording': {
       const delName = cmd.recording || '';
       const delFile = join(RECORDINGS_DIR, delName.endsWith('.json') ? delName : delName.replace(/[^a-zA-Z0-9_\- ]/g, '_').toLowerCase() + '.json');
@@ -13238,7 +13652,26 @@ async function playRecording(nameOrFile: string, speed: number = 1, variables: R
   isPlaying = true;
   try {
   speed = Math.max(0.1, Math.min(10, speed));
+  resetPlaybackControl();
+  playbackControl.speed = speed;
+  playbackControl.total = recording.actions.length;
+  playbackControl.name = recording.name;
   console.log(`[Playback] Playing "${recording.name}" (${recording.actions.length} actions, ${speed}x speed, engine: ${recording.engine || 'legacy'})`);
+
+  // Force-navigate back to the recording's start origin. Used both for the
+  // initial run and when the user scrubs/rewinds backward (a seek to an index
+  // at or before the cursor): replaying forward from a known origin is the only
+  // correct way to "rewind" an action replay, since clicks/types can't be undone.
+  const goToStart = async () => {
+    if (!recording.startUrl) return;
+    try {
+      const baseUrl = new URL(recording.startUrl).origin;
+      console.log(`[Playback] Navigating to start: ${baseUrl}`);
+      await cdpPost('/navigate', { url: baseUrl });
+      await new Promise(r => setTimeout(r, 2000));
+      try { await injectOverlay(); } catch {}
+    } catch {}
+  };
 
   // Navigate to start URL (use origin for SPA deep links — server doesn't handle client routes)
   if (recording.startUrl) {
@@ -13293,16 +13726,59 @@ async function playRecording(nameOrFile: string, speed: number = 1, variables: R
   }
 
   broadcastToOverlay({ type: 'playback_state', playing: true, name: recording.name, total: recording.actions.length });
+  broadcastToOverlay(transportSnapshot());
 
   const results: { step: number; action: string; ok: boolean; error?: string; method?: string; warning?: string; hit?: string }[] = [];
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-  for (let i = 0; i < recording.actions.length; i++) {
+  let i = 0;
+  let fastUntil = -1;  // while i < fastUntil, replay with minimal delay (used when seeking)
+  while (i < recording.actions.length) {
+    if (playbackControl.stop) break;
+
+    // Handle a pending seek (scrub / rewind / fast-forward / restart). A target
+    // at or before the cursor means rewind: re-navigate to start and replay
+    // forward at speed until the target. A target ahead means fast-forward
+    // through the intervening actions (state stays consistent).
+    if (playbackControl.seekTo !== null) {
+      const target = Math.max(0, Math.min(recording.actions.length - 1, playbackControl.seekTo));
+      playbackControl.seekTo = null;
+      if (target <= i) {
+        playbackControl.current = 0;
+        broadcastToOverlay(transportSnapshot({ seeking: true, current: 0 }));
+        await goToStart();
+        if (playbackControl.stop) break;
+        i = 0;
+      }
+      fastUntil = target;
+      broadcastToOverlay(transportSnapshot({ seeking: true }));
+    }
+
+    // Pause gate — held while paused; released by resume / stop / seek / step.
+    while (playbackControl.paused && !playbackControl.stop && playbackControl.seekTo === null && !playbackControl.stepOnce) {
+      await sleep(120);
+    }
+    if (playbackControl.stop) break;
+    if (playbackControl.seekTo !== null) continue;  // a seek arrived during pause — handle it at the top
+    const stepping = playbackControl.stepOnce;
+    playbackControl.stepOnce = false;
+
     const act = recording.actions[i];
+    const fast = i < fastUntil;
+    playbackControl.current = i;
+    playbackControl.action = act.action;   // so a mid-playback synced overlay shows the real action, not "Starting…"
+    playbackControl.ref = act.ref || '';
     broadcastToOverlay({ type: 'playback_step', step: i + 1, total: recording.actions.length, action: act.action, ref: act.ref });
+    broadcastToOverlay(transportSnapshot());
 
-    // Delay — minimum 800ms between actions so playback is watchable
-    const delay = Math.max(800 / speed, act.delay / speed);
-    await new Promise(r => setTimeout(r, delay));
+    // Delay — minimum 800ms between actions so playback is watchable (skipped
+    // while fast-seeking). Speed is read live so the scrubber's speed control
+    // takes effect mid-playback.
+    const liveSpeed = playbackControl.speed || 1;
+    const delay = fast ? 25 : Math.max(800 / liveSpeed, act.delay / liveSpeed);
+    await sleep(delay);
+    if (playbackControl.stop) break;
+    if (playbackControl.seekTo !== null) continue;  // re-handle seek before executing
 
     // Tab routing: if the recording tagged this action with the URL it was captured on,
     // ensure the bridge is focused on that tab. /navigate switches to an already-open tab
@@ -13695,17 +14171,29 @@ async function playRecording(nameOrFile: string, speed: number = 1, variables: R
       results.push({ step: i + 1, action: act.action, ok: false, error: e.message });
       console.log(`[Playback] Error at step ${i + 1}: ${e.message}`);
     }
+
+    i++;
+    if (fastUntil >= 0 && i >= fastUntil) fastUntil = -1;  // reached the seek target — resume normal pacing
+    // Single-step (Step button): execute exactly one action, then hold again.
+    if (stepping && !playbackControl.stop && playbackControl.seekTo === null) {
+      playbackControl.current = Math.min(i, recording.actions.length - 1);
+      playbackControl.paused = true;
+      broadcastToOverlay(transportSnapshot());
+    }
   }
 
+  const stopped = playbackControl.stop;
   isPlaying = false;
   const passed = results.filter(r => r.ok).length;
   const failed = results.filter(r => !r.ok).length;
   const warnings = results.filter((r: any) => r.warning).map((r: any) => `step ${r.step}: ${r.warning}`);
-  broadcastToOverlay({ type: 'playback_state', playing: false, name: recording.name, passed, failed });
-  console.log(`[Playback] Done. ${passed}/${results.length} steps passed${failed ? `, ${failed} failed` : ''}${warnings.length ? `, ${warnings.length} warnings` : ''}.`);
-  return { name: recording.name, results, passed, failed, total: results.length, warnings };
+  broadcastToOverlay({ type: 'playback_state', playing: false, name: recording.name, passed, failed, stopped });
+  broadcastToOverlay(transportSnapshot({ active: false, stopped }));
+  console.log(`[Playback] ${stopped ? 'Stopped' : 'Done'}. ${passed}/${results.length} steps ran${failed ? `, ${failed} failed` : ''}${warnings.length ? `, ${warnings.length} warnings` : ''}.`);
+  return { name: recording.name, results, passed, failed, total: results.length, warnings, stopped };
   } finally {
     isPlaying = false;
+    resetPlaybackControl();
   }
 }
 
@@ -13731,7 +14219,7 @@ function broadcastToOverlay(msg: any) {
     }
   }
   // Also push into every CDP-injected page that has __empir3_inbox.
-  if (cdpConnected) {
+  if (cdpConnected && pruneOverlayClients() === 0) {
     pushToCdpOverlay(msg).catch(() => { /* tab nav races; non-fatal */ });
   }
 }
@@ -13788,6 +14276,7 @@ function startOverlayPoll() {
   if (overlayPollHandle) return;
   overlayPollHandle = setInterval(async () => {
     if (!cdpConnected) return;
+    if (pruneOverlayClients() > 0) return;
     if (overlayPollInFlight) return;
     overlayPollInFlight = true;
     try {
@@ -13828,7 +14317,7 @@ function startOverlayPoll() {
       }
     } catch { /* poll storm during nav is fine */ }
     finally { overlayPollInFlight = false; }
-  }, 750);
+  }, 2000);
 }
 function stopOverlayPoll() {
   if (overlayPollHandle) { clearInterval(overlayPollHandle); overlayPollHandle = null; }
@@ -13846,19 +14335,30 @@ function saveSessionContext() {
  * by calling window.__empir3_inbox(jsonStr). No WebSocket from the page side,
  * so no mixed-content blocks.
  */
+let _standaloneOverlayScript: string | null = null;
 function getStandaloneOverlayScript(): string {
   // Keep the no-extension path feature-complete. This reuses the full browser
   // overlay with side switching, page push, annotate, draw, record, and play
   // instead of the older reduced CDP panel.
-  return getOverlayScript(BRIDGE_NONCE);
+  //
+  // Memoized: BRIDGE_NONCE is stable for the life of the process and
+  // getOverlayScript builds a ~111KB template literal. Rebuilding it on every
+  // injectOverlay / health-loop / auto-inject call (and re-stringifying it over
+  // the loopback HTTP hop to the CDP bridge) was a large recurring sync allocation
+  // on the shared event loop — cache it once.
+  if (_standaloneOverlayScript === null) _standaloneOverlayScript = getOverlayScript(BRIDGE_NONCE);
+  return _standaloneOverlayScript;
 }
 
 /** Inject overlay into Chrome via Empir3 Bridge's evaluate endpoint */
-async function injectOverlay(): Promise<Record<string, any>> {
+async function injectOverlay(opts: { timeoutMs?: number } = {}): Promise<Record<string, any>> {
   if (!cdpConnected) return { ok: false, error: 'browser disconnected' };
   try {
     const overlayScript = getStandaloneOverlayScript();
-    const result = await cdpPost('/evaluate', { expression: overlayScript });
+    const result = await cdpPost('/evaluate', { expression: overlayScript }, {
+      timeoutMs: opts.timeoutMs ?? 5000,
+      wakeOnNotReady: false,
+    });
     overlayInjected = true;
     startOverlayPoll();
     console.log('[Bridge] Browser overlay injected via CDP evaluate');
@@ -13874,12 +14374,15 @@ async function injectOverlay(): Promise<Record<string, any>> {
  * Inject overlay into ALL open tabs via the bridge's /evaluate-all endpoint.
  * Also registers the overlay as the auto-inject script so new tabs get it automatically.
  */
-async function injectOverlayAll(): Promise<Record<string, any>> {
+async function injectOverlayAll(opts: { timeoutMs?: number } = {}): Promise<Record<string, any>> {
   if (!cdpConnected) return { ok: false, error: 'browser disconnected' };
   try {
     const overlayScript = getStandaloneOverlayScript();
     // Register for auto-injection into future tabs + inject into all current tabs
-    const result: any = await cdpPost('/register-auto-inject', { script: overlayScript });
+    const result: any = await cdpPost('/register-auto-inject', { script: overlayScript }, {
+      timeoutMs: opts.timeoutMs ?? 5000,
+      wakeOnNotReady: false,
+    });
     const injected = result?.injected || [];
     const ok = injected.filter((r: any) => r.ok).length;
     const fail = injected.filter((r: any) => !r.ok).length;
@@ -13894,7 +14397,7 @@ async function injectOverlayAll(): Promise<Record<string, any>> {
   }
 }
 
-async function currentOverlayDomState(): Promise<Record<string, any>> {
+async function currentOverlayDomState(opts: { timeoutMs?: number } = {}): Promise<Record<string, any>> {
   if (!cdpConnected) return { ok: false, error: 'browser disconnected' };
   try {
     const r = await cdpPost('/evaluate', {
@@ -13909,7 +14412,7 @@ async function currentOverlayDomState(): Promise<Record<string, any>> {
         wsLastCloseAt: window.__empir3WsLastCloseAt || 0,
         outboxLength: Array.isArray(window.__empir3_outbox) ? window.__empir3_outbox.length : null
       })`,
-    }, { wakeOnNotReady: false });
+    }, { timeoutMs: opts.timeoutMs ?? 1500, wakeOnNotReady: false });
     const raw = r?.result ?? r;
     const parsed = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});
     return { ok: true, ...parsed };
@@ -13928,13 +14431,14 @@ async function waitForOverlayClient(timeoutMs: number): Promise<boolean> {
 
 async function ensureOverlayReady(
   reason = 'ensure',
-  opts: { waitMs?: number; force?: boolean } = {},
+  opts: { waitMs?: number; force?: boolean; cdpTimeoutMs?: number } = {},
 ): Promise<Record<string, any>> {
   if (!cdpConnected) {
     return { ok: false, connected: false, reason, error: 'browser disconnected' };
   }
+  const cdpTimeoutMs = Math.max(500, Math.min(6000, opts.cdpTimeoutMs ?? 3000));
   const socketCount = pruneOverlayClients();
-  const dom = await currentOverlayDomState();
+  const dom = await currentOverlayDomState({ timeoutMs: Math.min(1500, cdpTimeoutMs) });
   const domReady = overlayDomReady(dom);
   if (!opts.force && socketCount > 0 && domReady) {
     overlayInjected = true;
@@ -13948,7 +14452,16 @@ async function ensureOverlayReady(
     };
   }
   if (!opts.force && socketCount > 0 && !domReady) {
-    console.log('[Bridge] Overlay socket exists but current page overlay is not ready; repairing injection...');
+    overlayInjected = true;
+    return {
+      ok: true,
+      connected: true,
+      reason,
+      overlayClients: socketCount,
+      overlayInjected,
+      dom,
+      warning: 'overlay socket connected; skipped automatic repair',
+    };
   }
 
   if (overlayEnsureInFlight) return overlayEnsureInFlight;
@@ -13956,14 +14469,14 @@ async function ensureOverlayReady(
   overlayEnsureInFlight = (async () => {
     lastOverlayEnsureAt = Date.now();
     const before = dom;
-    const all = await injectOverlayAll();
+    const all = await injectOverlayAll({ timeoutMs: cdpTimeoutMs });
     let connected = await waitForOverlayClient(opts.waitMs ?? 5000);
     let single: Record<string, any> | null = null;
     if (!connected) {
-      single = await injectOverlay();
+      single = await injectOverlay({ timeoutMs: cdpTimeoutMs });
       connected = await waitForOverlayClient(Math.min(3000, opts.waitMs ?? 5000));
     }
-    const after = await currentOverlayDomState();
+    const after = await currentOverlayDomState({ timeoutMs: Math.min(1500, cdpTimeoutMs) });
     const usable = connected || overlayDomReady(after);
     if (usable) overlayInjected = true;
     return {
@@ -13991,9 +14504,12 @@ function startOverlayHealthLoop() {
   overlayHealthTimer = setInterval(async () => {
     if (!cdpConnected || overlayEnsureInFlight) return;
     if (Date.now() - lastOverlayEnsureAt < 8000) return;
-    const dom = await currentOverlayDomState();
-    if (pruneOverlayClients() > 0 && overlayDomReady(dom)) return;
-    ensureOverlayReady('health_loop', { waitMs: 2500 })
+    const dom = await currentOverlayDomState({ timeoutMs: 1000 });
+    if (pruneOverlayClients() > 0) {
+      if (overlayDomReady(dom)) overlayInjected = true;
+      return;
+    }
+    ensureOverlayReady('health_loop', { waitMs: 1000, cdpTimeoutMs: 1200 })
       .then(r => {
         if (!r.ok) console.log(`[Bridge] Overlay health repair failed: ${r.error || 'not connected'}`);
       })
@@ -15187,7 +15703,24 @@ function getWelcomeHtml(apiBase = '') {
     if (!r.ok && !j.ok) throw new Error(j.error || ('http ' + r.status));
     return j;
   }
-  async function getJson(path) { return (await fetch(API + path)).json(); }
+  // Single-flight per path + abort timeout. The dashboard runs ~6 polling
+  // intervals (status/actions/focus/recording/cli/settings); if the daemon is
+  // momentarily slow, fixed-clock intervals would re-fire before the prior fetch
+  // returns and pile up concurrent requests — which loads the daemon's shared
+  // event loop further and feeds a slow-loop⇄pile-up spiral. Collapsing
+  // same-path GETs to one in-flight request (and aborting a stuck one) prevents
+  // that pile-up so the daemon's trivial handlers stay responsive.
+  var __getJsonInflight = {};
+  async function getJson(path) {
+    if (__getJsonInflight[path]) return __getJsonInflight[path];
+    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function(){ try { ctrl.abort(); } catch (e) {} }, 8000) : null;
+    var p = fetch(API + path, ctrl ? { signal: ctrl.signal } : undefined)
+      .then(function(r){ return r.json(); })
+      .finally(function(){ if (timer) clearTimeout(timer); delete __getJsonInflight[path]; });
+    __getJsonInflight[path] = p;
+    return p;
+  }
   async function postJson(path, body) {
     return api(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {}) });
   }
@@ -15533,10 +16066,16 @@ function getWelcomeHtml(apiBase = '') {
       var s = await getJson('/api/status');
       var rs = await getJson('/api/relay-status');
       var uptimeMs = rs.uptimeMs || 0;
-      // Daemon telemetry
-      setText('teleDaemonVal', s.running ? 'RUNNING' : 'OFFLINE');
+      // Daemon telemetry. The daemon answered with a valid status payload, so it
+      // is alive BY DEFINITION here. Daemon/MCP liveness must NOT be gated on
+      // s.running (= cdpConnected, the Chrome/CDP browser link) — closing Chrome
+      // leaves the daemon perfectly healthy. The browser/CDP state is surfaced
+      // separately by the Desktop-tools indicator (dtBridge*) below. (getJson
+      // doesn't check res.ok, so validate the payload shape, not just "no throw".)
+      var daemonAlive = !!(s && s.engine === 'empir3-bridge');
+      setText('teleDaemonVal', daemonAlive ? 'RUNNING' : 'OFFLINE');
       setText('teleDaemonSub', (s.pid ? 'PID ' + s.pid + ' · ' : '') + 'uptime ' + formatUptime(uptimeMs));
-      var dled = $('teleDaemonLed'); if (dled){ dled.classList.remove('warn','bad','idle'); if (!s.running) dled.classList.add('bad'); }
+      var dled = $('teleDaemonLed'); if (dled){ dled.classList.remove('warn','bad','idle'); if (!daemonAlive) dled.classList.add('bad'); }
       // Desktop tools harness telemetry
       setText('dtBridgeStatus', s.running ? 'Connected' : 'Disconnected');
       setMetricTone('dtBridgeStatus', s.running ? 'good' : 'bad');
@@ -15557,15 +16096,18 @@ function getWelcomeHtml(apiBase = '') {
       var healthTag = $('daemonHealthTag');
       if (healthTag) {
         healthTag.classList.remove('good','warn','bad');
-        if (s.running) { healthTag.classList.add('good'); healthTag.textContent = 'HEALTHY'; }
+        if (daemonAlive) { healthTag.classList.add('good'); healthTag.textContent = 'HEALTHY'; }
         else { healthTag.classList.add('bad'); healthTag.textContent = 'OFFLINE'; }
       }
       // Rail foot
       setText('footDaemonUptime', formatUptime(uptimeMs));
-      var fdLed = $('footDaemonLed'); if (fdLed){ fdLed.classList.remove('warn','bad'); if (!s.running) fdLed.classList.add('bad'); }
-      // MCP cell (we treat MCP as ready if daemon is running; calls counted from /api/actions)
-      setText('teleMcpVal', s.running ? 'READY' : 'OFFLINE');
-      var mled = $('teleMcpLed'); if (mled){ mled.classList.remove('warn','bad'); if (!s.running) mled.classList.add('bad'); }
+      var fdLed = $('footDaemonLed'); if (fdLed){ fdLed.classList.remove('warn','bad'); if (!daemonAlive) fdLed.classList.add('bad'); }
+      var fmLed = $('footMcpLed'); if (fmLed){ fmLed.classList.remove('warn','bad'); if (!daemonAlive) fmLed.classList.add('bad'); }
+      // MCP cell — the stdio MCP server IS the daemon, so MCP is READY whenever
+      // the daemon is reachable (NOT gated on the browser/CDP link). Calls are
+      // counted from /api/actions.
+      setText('teleMcpVal', daemonAlive ? 'READY' : 'OFFLINE');
+      var mled = $('teleMcpLed'); if (mled){ mled.classList.remove('warn','bad'); if (!daemonAlive) mled.classList.add('bad'); }
       // Relay
       var rConn = !!(rs.relay && rs.relay.connected);
       var rPaired = !!rs.hasAuth;
@@ -15607,9 +16149,20 @@ function getWelcomeHtml(apiBase = '') {
         document.body.dataset.view = 'signedout';
       }
     } catch (e) {
-      // Daemon unreachable
+      // Daemon unreachable — reset the ENTIRE daemon family to OFFLINE, not just
+      // the daemon pill. Leaving MCP / health / foot LEDs / uptime at their last
+      // good value would paint a half-green console over a dead daemon.
       setText('teleDaemonVal','OFFLINE');
-      var dled2 = $('teleDaemonLed'); if (dled2){ dled2.classList.add('bad'); }
+      var dled2 = $('teleDaemonLed'); if (dled2){ dled2.classList.remove('warn','idle'); dled2.classList.add('bad'); }
+      setText('teleMcpVal','OFFLINE');
+      var mled2 = $('teleMcpLed'); if (mled2){ mled2.classList.remove('warn'); mled2.classList.add('bad'); }
+      var healthTag2 = $('daemonHealthTag');
+      if (healthTag2) { healthTag2.classList.remove('good','warn'); healthTag2.classList.add('bad'); healthTag2.textContent = 'OFFLINE'; }
+      var fdLed2 = $('footDaemonLed'); if (fdLed2){ fdLed2.classList.remove('warn'); fdLed2.classList.add('bad'); }
+      var fmLed2 = $('footMcpLed'); if (fmLed2){ fmLed2.classList.remove('warn'); fmLed2.classList.add('bad'); }
+      setText('footDaemonUptime','—');
+      setText('daemonUptime','—');
+      setText('ovDaemonUptime','—');
       setText('dtBridgeStatus','Disconnected');
       setMetricTone('dtBridgeStatus','bad');
       var dtTag2 = $('dtBridgeTag'); if (dtTag2) { dtTag2.textContent = 'OFFLINE'; dtTag2.className = 'tag bad'; }
@@ -16626,6 +17179,8 @@ function getWelcomeHtml(apiBase = '') {
   var rescanBtn = $('rescanClisBtn');
   if (rescanBtn) rescanBtn.addEventListener('click', async function(){
     setStatus('cliStatus', 'Re-scanning installed CLIs…', 'info');
+    // Force a fresh probe (bypass the server-side CLI-probe cache), then render.
+    try { await getJson('/api/settings/state?fresh=1'); } catch (e) {}
     await loadCliState();
     setStatus('cliStatus', 'Re-scan complete.', 'ok');
   });
@@ -16749,8 +17304,9 @@ async function urlWatcher() {
       continue;
     }
     try {
-      const r = await cdpPost('/evaluate', { expression: 'location.href' }, { wakeOnNotReady: false });
-      const newUrl = r?.result || '';
+      const state = await browserTabState();
+      const current = state.tabs.find((t: any) => t.bridgeCurrent) || state.tabs[0];
+      const newUrl = current?.url || '';
       if (newUrl && newUrl !== lastKnownUrl) {
         lastKnownUrl = newUrl;
         currentUrl = newUrl;
@@ -16758,8 +17314,6 @@ async function urlWatcher() {
         if (!sessionCtx.pages.includes(newUrl)) sessionCtx.pages.push(newUrl);
         saveSessionContext();
         try {
-          const state = await browserTabState();
-          const current = state.tabs.find((t: any) => t.bridgeCurrent);
           if (current && agentControlTarget && sameTabTarget(current, agentControlTarget)) {
             agentControlTarget = { ...agentControlTarget, url: current.url, title: current.title, updatedAt: new Date().toISOString(), source: 'url_watcher' };
             await broadcastBrowserTabState();
@@ -20056,17 +20610,22 @@ function getOverlayScript(bridgeNonce = '') {
       if (msg.playing) {
         statusText.textContent = '\\u25b6 Playing: ' + msg.name;
         edgeGlow.style.borderColor = 'rgba(34,197,94,0.4)';
+        transportShow(msg.name, msg.total);
       } else {
         statusText.textContent = msg.passed !== undefined
-          ? '\\u2713 Playback: ' + msg.passed + '/' + (msg.passed + msg.failed) + ' passed'
+          ? (msg.stopped ? '\\u23f9 Stopped: ' : '\\u2713 Playback: ') + msg.passed + '/' + (msg.passed + msg.failed) + ' ran'
           : '';
         edgeGlow.style.borderColor = 'rgba(59,130,246,0.15)';
         if (msg.passed === undefined) setBridgeStatus('Bridge');
+        transportFinish(msg);
         setTimeout(() => { setBridgeStatus('Bridge'); }, 5000);
       }
     }
     if (msg.type === 'playback_step') {
       statusText.textContent = '\\u25b6 Step ' + msg.step + '/' + msg.total + ': ' + msg.action + (msg.ref ? ' [' + msg.ref + ']' : '');
+    }
+    if (msg.type === 'playback_transport') {
+      transportUpdate(msg);
     }
   }
 
@@ -20075,6 +20634,177 @@ function getOverlayScript(bridgeNonce = '') {
     _origHandle(msg);
     handleRecordingState(msg);
   };
+
+  // ─── Playback Transport (scrubber + controls) ──────────
+  // Appears while a recording plays. Pause/resume, stop, single-step, a
+  // draggable scrubber (seek/rewind/fast-forward) and a live speed selector.
+  // Controls go out over the same WS/CDP-mailbox command path as Rec/Stop, so
+  // they work on both http and https pages.
+  let transportTotal = 0, transportCurrent = 0, transportPaused = false, transportSpeed = 1;
+  let transportScrubbing = false, transportHideTimer = null;
+  const TRANSPORT_SPEEDS = [0.5, 1, 2, 4];
+
+  const transportBar = document.createElement('div');
+  transportBar.id = 'empir3-transport';
+  Object.assign(transportBar.style, { position:'fixed', bottom:'46px', left:'50%', transform:'translateX(-50%)',
+    background:'rgba(10,15,30,0.96)', backdropFilter:'blur(12px)', border:'1px solid rgba(59,130,246,0.3)',
+    borderRadius:'14px', padding:'10px 14px 12px', zIndex:'2147483646', width:'380px', maxWidth:'90vw',
+    boxShadow:'0 10px 40px rgba(0,0,0,0.6)', display:'none', flexDirection:'column', gap:'7px',
+    fontFamily:'-apple-system,BlinkMacSystemFont,sans-serif', userSelect:'none' });
+  transportBar.addEventListener('mousedown', (e) => e.stopPropagation());
+
+  const tHead = document.createElement('div');
+  Object.assign(tHead.style, { display:'flex', alignItems:'center', justifyContent:'space-between', gap:'8px' });
+  const tTitle = document.createElement('div');
+  Object.assign(tTitle.style, { color:'#e2e8f0', fontSize:'12px', fontWeight:'600', overflow:'hidden',
+    textOverflow:'ellipsis', whiteSpace:'nowrap', flex:'1', minWidth:'0' });
+  const tCounter = document.createElement('div');
+  Object.assign(tCounter.style, { color:'#94a3b8', fontSize:'11px', fontWeight:'500', flexShrink:'0', fontVariantNumeric:'tabular-nums' });
+  tHead.append(tTitle, tCounter);
+
+  const tTrack = document.createElement('div');
+  Object.assign(tTrack.style, { position:'relative', height:'8px', background:'#1e293b', borderRadius:'5px',
+    cursor:'pointer', margin:'3px 6px', touchAction:'none' });
+  const tFill = document.createElement('div');
+  Object.assign(tFill.style, { position:'absolute', left:'0', top:'0', bottom:'0', width:'0%',
+    background:'linear-gradient(90deg,#3b82f6,#22c55e)', borderRadius:'5px', pointerEvents:'none' });
+  const tThumb = document.createElement('div');
+  Object.assign(tThumb.style, { position:'absolute', top:'50%', left:'0%', width:'14px', height:'14px',
+    background:'#fff', border:'2px solid #3b82f6', borderRadius:'50%', transform:'translate(-50%,-50%)',
+    boxShadow:'0 1px 4px rgba(0,0,0,0.5)', pointerEvents:'none' });
+  tTrack.append(tFill, tThumb);
+
+  const tAction = document.createElement('div');
+  Object.assign(tAction.style, { color:'#64748b', fontSize:'10px', whiteSpace:'nowrap', overflow:'hidden',
+    textOverflow:'ellipsis', minHeight:'12px', padding:'0 6px' });
+
+  const tControls = document.createElement('div');
+  Object.assign(tControls.style, { display:'flex', alignItems:'center', gap:'4px', justifyContent:'center', flexWrap:'wrap' });
+
+  const tRestart = _mkTbBtn('\\u23ee', 'Restart from beginning');
+  const tPause = _mkTbBtn('\\u23f8', 'Pause');
+  const tStep = _mkTbBtn('\\u23ed', 'Step one action (while paused)');
+  const tStop = _mkTbBtn('\\u23f9', 'Stop playback');
+  tStop._setActive(true, '#f87171');
+
+  const tSep = document.createElement('span');
+  Object.assign(tSep.style, { width:'1px', height:'16px', background:'rgba(148,163,184,0.25)', margin:'0 3px', flexShrink:'0' });
+
+  const speedBtns = TRANSPORT_SPEEDS.map(s => {
+    const b = _mkTbBtn(s + '\\u00d7', 'Playback speed ' + s + '\\u00d7');
+    b.style.fontSize = '11px'; b.style.padding = '3px 6px';
+    b.onclick = (e) => { e.stopPropagation(); setTransportSpeed(s); };
+    return b;
+  });
+
+  tControls.append(tRestart, tPause, tStep, tStop, tSep);
+  speedBtns.forEach(b => tControls.appendChild(b));
+  transportBar.append(tHead, tTrack, tAction, tControls);
+  document.body.appendChild(transportBar);
+
+  function sendPlaybackCtl(data) {
+    try { send({ type: 'command', data }); } catch (_) {}
+  }
+
+  function renderTransport() {
+    const total = Math.max(1, transportTotal);
+    const cur = Math.max(0, Math.min(transportCurrent, total - 1));
+    const pct = total <= 1 ? 0 : (cur / (total - 1)) * 100;
+    if (!transportScrubbing) {
+      tFill.style.width = pct + '%';
+      tThumb.style.left = pct + '%';
+      tCounter.textContent = (transportTotal ? (cur + 1) : 0) + ' / ' + transportTotal;
+    }
+    tPause.innerHTML = transportPaused ? '\\u25b6' : '\\u23f8';
+    tPause.title = transportPaused ? 'Resume' : 'Pause';
+    tStep.style.opacity = transportPaused ? '1' : '0.4';
+    tStep.style.pointerEvents = transportPaused ? 'auto' : 'none';
+    speedBtns.forEach((b, idx) => b._setActive(Math.abs(TRANSPORT_SPEEDS[idx] - transportSpeed) < 0.001, '#22c55e'));
+  }
+
+  function transportShow(name, total) {
+    if (typeof total === 'number' && total > 0) transportTotal = total;
+    transportCurrent = 0;
+    transportPaused = false;
+    if (transportHideTimer) { clearTimeout(transportHideTimer); transportHideTimer = null; }
+    tTitle.textContent = '\\u25b6 ' + (name || 'Playing');
+    tAction.textContent = 'Starting\\u2026';
+    transportBar.style.display = 'flex';
+    renderTransport();
+  }
+
+  function transportUpdate(msg) {
+    if (typeof msg.total === 'number' && msg.total > 0) transportTotal = msg.total;
+    if (!transportScrubbing && typeof msg.current === 'number') transportCurrent = msg.current;
+    if (typeof msg.paused === 'boolean') transportPaused = msg.paused;
+    if (typeof msg.speed === 'number') transportSpeed = msg.speed;
+    if (msg.name) tTitle.textContent = (transportPaused ? '\\u23f8 ' : '\\u25b6 ') + msg.name;
+    if (msg.action) tAction.textContent = (msg.seeking ? '\\u2026 ' : '') + msg.action + (msg.ref ? ' [' + msg.ref + ']' : '');
+    else if (msg.seeking) tAction.textContent = '\\u2026 seeking';
+    if (msg.active === false) { transportFinish(msg); return; }
+    if (transportBar.style.display === 'none') transportBar.style.display = 'flex';
+    renderTransport();
+  }
+
+  function transportFinish(msg) {
+    transportPaused = false;
+    if (msg && msg.stopped) tAction.textContent = 'Stopped';
+    else if (msg && typeof msg.passed === 'number') tAction.textContent = 'Done \\u2014 ' + msg.passed + '/' + (msg.passed + (msg.failed || 0)) + ' ran';
+    renderTransport();
+    if (transportHideTimer) clearTimeout(transportHideTimer);
+    transportHideTimer = setTimeout(() => { transportBar.style.display = 'none'; }, 2500);
+  }
+
+  function setTransportSpeed(s) {
+    transportSpeed = s;
+    renderTransport();
+    sendPlaybackCtl({ type: 'playback_speed', speed: s });
+  }
+
+  tRestart.onclick = (e) => { e.stopPropagation(); sendPlaybackCtl({ type: 'playback_seek', step: 0 }); };
+  tStop.onclick = (e) => { e.stopPropagation(); sendPlaybackCtl({ type: 'playback_stop' }); tAction.textContent = 'Stopping\\u2026'; };
+  tStep.onclick = (e) => { e.stopPropagation(); if (!transportPaused) return; sendPlaybackCtl({ type: 'playback_step' }); };
+  tPause.onclick = (e) => {
+    e.stopPropagation();
+    transportPaused = !transportPaused;          // optimistic — server confirms via playback_transport
+    sendPlaybackCtl({ type: transportPaused ? 'playback_pause' : 'playback_resume' });
+    renderTransport();
+  };
+
+  // Scrubber drag — seek on release (rewind if backward, fast-forward if ahead)
+  function transportPctFromEvent(e) {
+    const rect = tTrack.getBoundingClientRect();
+    if (!rect.width) return 0;
+    return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  }
+  function transportIndexFromPct(p) {
+    return Math.round(p * Math.max(0, transportTotal - 1));
+  }
+  function transportPreview(p) {
+    tFill.style.width = (p * 100) + '%';
+    tThumb.style.left = (p * 100) + '%';
+    tCounter.textContent = (transportIndexFromPct(p) + 1) + ' / ' + transportTotal;
+  }
+  tTrack.addEventListener('pointerdown', (e) => {
+    e.stopPropagation(); e.preventDefault();
+    transportScrubbing = true;
+    try { tTrack.setPointerCapture(e.pointerId); } catch (_) {}
+    transportPreview(transportPctFromEvent(e));
+  });
+  tTrack.addEventListener('pointermove', (e) => {
+    if (!transportScrubbing) return;
+    transportPreview(transportPctFromEvent(e));
+  });
+  function transportEndScrub(e) {
+    if (!transportScrubbing) return;
+    transportScrubbing = false;
+    const idx = transportIndexFromPct(transportPctFromEvent(e));
+    transportCurrent = idx;
+    sendPlaybackCtl({ type: 'playback_seek', step: idx });
+    renderTransport();
+  }
+  tTrack.addEventListener('pointerup', (e) => { e.stopPropagation(); transportEndScrub(e); });
+  tTrack.addEventListener('pointercancel', (e) => { transportEndScrub(e); });
 
   // ─── Playback Panel ────────────────────────
 
@@ -20224,6 +20954,7 @@ function getOverlayScript(bridgeNonce = '') {
   function playRecordingFromUI(name) {
     togglePlayPanel();
     statusText.textContent = '\\u25b6 Starting: ' + name;
+    transportShow(name);  // show the scrubber immediately; populated by playback_state/_transport
     fetch('http://localhost:${PORT}/api/command', {
       method:'POST', headers: bridgeHttpHeaders({'Content-Type':'application/json'}),
       body:JSON.stringify({ type:'play', recording:name, speed:1, variables:{} })

@@ -1,6 +1,6 @@
 {
   "name": "@empir3hq/bridge",
-  "version": "0.3.4",
+  "version": "0.3.21",
   "description": "Local-first browser and desktop control bridge for AI agents using MCP.",
   "license": "MIT",
   "author": "Empir3",

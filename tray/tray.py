@@ -415,16 +415,19 @@ def is_newer(remote: str, local: str) -> bool:
 CANDIDATE_PORTS = [3006, 3106, 3206, 3306]
 BRIDGE_CONTROL_PORTS = sorted(set(CANDIDATE_PORTS + [9867, 9222]))
 STATUS_POLL_SEC = 4.0
-# Daemon HTTP responses are usually <50ms but spike briefly under load (PS
-# spawns for desktop ops, GC, brief WS reconnects). Be patient before flagging
-# unreachable so the tray icon doesn't flap green→red→green every few seconds
-# during a fully-working session.
-STATUS_HTTP_TIMEOUT_SEC = 3.0
+# Daemon HTTP responses are usually <50ms but can stall for several seconds when
+# the daemon's shared event loop is momentarily busy (CDP/overlay work against an
+# open page, PS spawns, GC, WS reconnects). A slow-but-valid reply still proves the
+# daemon is ALIVE, so the timeout must exceed the worst observed stall — otherwise
+# every poll aborts as a TimeoutError and the tray falsely shows "Daemon not
+# running" while the browser dashboard (which tolerates the slow reply) shows
+# connected. Keep this well above the daemon's stall ceiling.
+STATUS_HTTP_TIMEOUT_SEC = 10.0
 # Require this many consecutive failed polls before we surface the daemon as
-# disconnected. With STATUS_POLL_SEC=4s, FAILS=2 means ~12s of misses before
-# the menu flips — covers the longest real outage we've seen without being
-# slow for a true crash.
-STATUS_DISCONNECT_AFTER_FAILS = 2
+# disconnected. With STATUS_POLL_SEC=4s, FAILS=3 means ~12s of genuine misses
+# before the menu flips — covers the longest real outage without flapping on a
+# transient slow spell.
+STATUS_DISCONNECT_AFTER_FAILS = 3
 RESTART_BACKOFF_SEC = [3, 5, 10, 30, 60]  # capped at last value
 SERVER_URL = os.environ.get('EMPIR3_SERVER', 'https://app.empir3.com')
 VERSION_MANIFEST_URL = f'{SERVER_URL}/downloads/bridge-version.json'

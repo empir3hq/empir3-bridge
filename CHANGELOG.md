@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Playback transport bar.** Replaying a recording now shows a media-player-style transport at the bottom of the page: a draggable scrubber (drag back to rewind — re-runs from the start to that point since actions can't be undone; drag forward to fast-forward), Restart / Pause-Resume / single-Step / Stop buttons, and live speed pills (0.5×/1×/2×/4×). Previously the only options were Rec and Play, with no way to pause, stop, scrub, or change speed once a recording started. Backed by six new interruptible-playback commands (`playback_pause`/`resume`/`stop`/`step`/`speed`/`seek`) that ride the same WS/CDP-mailbox path as Rec/Stop, so the controls work on both http and https pages. The current transport state is re-synced to any overlay that announces mid-playback, so the bar survives the page navigations a recording performs (and shows on https pages, which drive the overlay over the CDP mailbox).
 - **`--pair <code>` first-run auto-pairing.** `Empir3Setup.exe --pair <code>` redeems a pre-authorized Empir3 pairing session on first boot, so an install link can pair the bridge to an account with no second login.
 
 ## [0.3.4] - 2026-06-06

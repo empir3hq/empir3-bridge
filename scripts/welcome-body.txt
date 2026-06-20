@@ -313,7 +313,17 @@
   .desktop-metric .value.warn { color:var(--warn); }
   .desktop-metric .value.bad { color:var(--bad); }
   .desktop-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .desktop-actions input, .desktop-actions select { min-height:32px; padding:6px 9px; border:1px solid var(--line-strong); border-radius:4px; background:var(--paper); color:var(--ink); font:inherit; font-size:12.5px; }
+  .desktop-actions input { min-width:190px; }
+  .desktop-actions select { min-width:210px; max-width:100%; }
   .desktop-output { display:none; margin:12px 0 0; padding:10px; min-height:64px; max-height:220px; overflow:auto; border:1px solid var(--line); border-radius:4px; background:var(--surface); color:var(--ink); font:12px/1.45 var(--mono); white-space:pre-wrap; }
+  .setup-checklist { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; margin-bottom:14px; }
+  .setup-item { display:grid; grid-template-columns:16px 1fr; gap:9px; padding:10px; border:1px solid var(--line); border-radius:4px; background:var(--surface); min-width:0; }
+  .setup-dot { width:10px; height:10px; border-radius:50%; margin-top:3px; background:var(--faint); box-shadow:0 0 0 3px rgba(0,0,0,0.04); }
+  .setup-item.done .setup-dot { background:var(--good); }
+  .setup-item.warn .setup-dot { background:var(--warn); }
+  .setup-item strong { display:block; font-size:12.5px; color:var(--ink); }
+  .setup-item small { display:block; margin-top:2px; color:var(--muted); line-height:1.35; overflow-wrap:anywhere; }
 
   /* Sidebar overlay toggle — shown only below the breakpoint. Clicking
      pops the rail back in as a floating overlay so the user can pick a
@@ -371,6 +381,7 @@
     .kv { grid-template-columns:1fr; gap:2px; }
     .desktop-metrics { grid-template-columns:repeat(2, minmax(0, 1fr)); }
     .desktop-metric.wide { grid-column:1 / -1; }
+    .setup-checklist { grid-template-columns:1fr; }
     .drawer { width:100vw; max-width:100vw; }
     .drawer-body { padding:16px; }
     .drawer-body .fields { grid-template-columns:1fr; }
@@ -691,9 +702,10 @@
                 </tbody>
               </table>
             </div>
-            <div style="display:flex; gap:8px; margin-top:14px;">
+            <div style="display:flex; gap:8px; margin-top:14px; flex-wrap:wrap;">
+              <button class="btn" type="button" id="rescanClisBtn">↻ Re-scan</button>
               <button class="btn" type="button" id="addCustomProviderBtn">+ Add custom provider</button>
-              <span style="font-size:11.5px; color:var(--soft); align-self:center;">OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, vLLM, etc)</span>
+              <span style="font-size:11.5px; color:var(--soft); align-self:center;">Re-scan after installing a CLI · custom = OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, vLLM, etc)</span>
             </div>
             <p class="status" id="cliStatus" style="margin-top:10px;"></p>
           </div>
@@ -747,11 +759,35 @@
 
       <section class="pane" data-pane="agent">
         <h1 class="pane-title">Desktop Tools</h1>
-        <p class="pane-lede">Open the safe desktop-test harness, inspect the controlled browser window, and scope desktop actions before clicking real apps.</p>
+        <p class="pane-lede">Open the safe desktop-test harness or the Accuracy Lab click-precision stress test, inspect the controlled browser window, and scope desktop actions before clicking real apps.</p>
 
         <div class="block">
           <div class="block-head">
             <span class="ix">01</span>
+            <span class="title">Testing Tools And Calibration</span>
+            <span class="spacer"></span>
+            <span class="tag warn" id="setupTag">CHECK REQUIRED</span>
+          </div>
+          <div class="block-body">
+            <div class="setup-checklist">
+              <div class="setup-item" id="setupItemOverlay"><span class="setup-dot"></span><div><strong>Overlay chat injected</strong><small id="setupOverlayText">Checking overlay bubble.</small></div></div>
+              <div class="setup-item" id="setupItemMonitors"><span class="setup-dot"></span><div><strong>Monitors detected</strong><small id="setupMonitorText">Checking display map.</small></div></div>
+              <div class="setup-item" id="setupItemCalibration"><span class="setup-dot"></span><div><strong>Click calibration saved</strong><small id="setupCalibrationText">Checking persisted calibration.</small></div></div>
+              <div class="setup-item" id="setupItemRecordings"><span class="setup-dot"></span><div><strong>Recording tools ready</strong><small id="setupRecordingText">Checking record/playback surface.</small></div></div>
+            </div>
+            <div class="desktop-actions">
+              <button class="btn primary" id="setupInjectOverlay" type="button">Inject overlay chat</button>
+              <button class="btn" id="setupDetectMonitors" type="button">Detect monitors</button>
+              <button class="btn" id="setupCalibratePrimary" type="button">Calibrate primary</button>
+              <button class="btn" id="setupSaveComplete" type="button">Save setup complete</button>
+            </div>
+            <p class="status" id="setupStatus" style="margin-top:8px;"></p>
+          </div>
+        </div>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">02</span>
             <span class="title">Bridge Test Harness</span>
             <span class="spacer"></span>
             <span class="tag" id="dtBridgeTag">CHECKING</span>
@@ -785,10 +821,12 @@
             </div>
             <div class="desktop-actions">
               <button class="btn primary" id="dtOpenDesktopTest" type="button">Open desktop test</button>
+              <button class="btn primary" id="dtOpenAccuracyLab" type="button">Open Accuracy Lab</button>
               <button class="btn" id="dtBrowserScreenshot" type="button">Screenshot</button>
               <button class="btn" id="dtBrowserRefresh" type="button">Refresh</button>
               <button class="btn" id="dtBrowserSnapshot" type="button">Snapshot</button>
               <button class="btn" id="dtInjectOverlay" type="button">Inject overlay</button>
+              <button class="btn" id="dtOpenToolbar" type="button">Open floating toolbar</button>
               <button class="btn danger" id="dtRevokeControl" type="button">Revoke write control</button>
             </div>
             <pre class="desktop-output" id="dtCommandOutput"></pre>
@@ -798,7 +836,47 @@
 
         <div class="block">
           <div class="block-head">
-            <span class="ix">02</span>
+            <span class="ix">03</span>
+            <span class="title">Recording And Playback</span>
+            <span class="spacer"></span>
+            <span class="tag" id="recordingTag">IDLE</span>
+          </div>
+          <div class="block-body">
+            <div class="desktop-metrics">
+              <div class="desktop-metric">
+                <div class="label">Recorder</div>
+                <div class="value" id="recState">Idle</div>
+              </div>
+              <div class="desktop-metric">
+                <div class="label">Actions</div>
+                <div class="value" id="recActionCount">0</div>
+              </div>
+              <div class="desktop-metric">
+                <div class="label">Saved</div>
+                <div class="value" id="recSavedCount">0</div>
+              </div>
+              <div class="desktop-metric">
+                <div class="label">Playback</div>
+                <div class="value" id="recPlayState">Ready</div>
+              </div>
+            </div>
+            <div class="desktop-actions">
+              <button class="btn primary" id="recStart" type="button">Start recording</button>
+              <button class="btn" id="recStop" type="button">Stop and save</button>
+              <input id="recName" type="text" placeholder="Recording name">
+              <button class="btn" id="recRefresh" type="button">Pull recordings</button>
+              <select id="recSelect" aria-label="Saved recording"></select>
+              <button class="btn" id="recLoad" type="button">Pull up recording</button>
+              <button class="btn" id="recPlay" type="button">Play recording</button>
+            </div>
+            <pre class="desktop-output" id="recPreview"></pre>
+            <p class="status" id="recStatus" style="margin-top:8px;"></p>
+          </div>
+        </div>
+
+        <div class="block">
+          <div class="block-head">
+            <span class="ix">04</span>
             <span class="title">Focus Region</span>
             <span class="spacer"></span>
             <span class="tag" id="focusTag">NONE LOCKED</span>
@@ -811,7 +889,7 @@
             </div>
             <div style="display:flex; gap:8px; margin-top:14px; flex-wrap:wrap;">
               <button class="btn primary" id="agtSelectRegion" type="button">Select region…</button>
-              <button class="btn" id="agtReleaseFocus" type="button" disabled>Release focus</button>
+              <button class="btn" id="agtReleaseFocus" type="button">Release focus</button>
               <button class="btn" id="agtFocusGrid" type="button" disabled>Show focus grid</button>
             </div>
             <p class="status" id="agentStatus" style="margin-top:8px;"></p>
@@ -820,7 +898,7 @@
 
         <div class="block">
           <div class="block-head">
-            <span class="ix">03</span>
+            <span class="ix">05</span>
             <span class="title">Click Calibration</span>
             <span class="spacer"></span>
             <span class="tag" id="calibrationTag">UNCALIBRATED</span>
@@ -830,9 +908,13 @@
               <div class="k">Offset X</div><div class="v mono" id="calOffsetX">—</div>
               <div class="k">Offset Y</div><div class="v mono" id="calOffsetY">—</div>
               <div class="k">Last run</div><div class="v mono" id="calLastRun">—</div>
+              <div class="k">Monitors</div><div class="v mono" id="calMonitorSummary">-</div>
             </div>
-            <div style="display:flex; gap:8px; margin-top:14px;">
-              <button class="btn" id="agtCalibrate" type="button">Re-calibrate…</button>
+            <div class="desktop-actions" style="margin-top:14px;">
+              <button class="btn" id="agtDetectMonitors" type="button">Detect monitors</button>
+              <select id="agtCalMonitor" aria-label="Calibration monitor"><option value="primary">Primary monitor</option><option value="all">All monitors</option></select>
+              <button class="btn" id="agtCalibrate" type="button">Calibrate selected</button>
+              <button class="btn" id="agtCalibrateAll" type="button">Calibrate all</button>
             </div>
             <p class="status" id="calStatus" style="margin-top:8px;"></p>
           </div>
@@ -1101,7 +1183,24 @@
     if (!r.ok && !j.ok) throw new Error(j.error || ('http ' + r.status));
     return j;
   }
-  async function getJson(path) { return (await fetch(API + path)).json(); }
+  // Single-flight per path + abort timeout. The dashboard runs ~6 polling
+  // intervals (status/actions/focus/recording/cli/settings); if the daemon is
+  // momentarily slow, fixed-clock intervals would re-fire before the prior fetch
+  // returns and pile up concurrent requests — which loads the daemon's shared
+  // event loop further and feeds a slow-loop⇄pile-up spiral. Collapsing
+  // same-path GETs to one in-flight request (and aborting a stuck one) prevents
+  // that pile-up so the daemon's trivial handlers stay responsive.
+  var __getJsonInflight = {};
+  async function getJson(path) {
+    if (__getJsonInflight[path]) return __getJsonInflight[path];
+    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function(){ try { ctrl.abort(); } catch (e) {} }, 8000) : null;
+    var p = fetch(API + path, ctrl ? { signal: ctrl.signal } : undefined)
+      .then(function(r){ return r.json(); })
+      .finally(function(){ if (timer) clearTimeout(timer); delete __getJsonInflight[path]; });
+    __getJsonInflight[path] = p;
+    return p;
+  }
   async function postJson(path, body) {
     return api(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {}) });
   }
@@ -1447,10 +1546,16 @@
       var s = await getJson('/api/status');
       var rs = await getJson('/api/relay-status');
       var uptimeMs = rs.uptimeMs || 0;
-      // Daemon telemetry
-      setText('teleDaemonVal', s.running ? 'RUNNING' : 'OFFLINE');
+      // Daemon telemetry. The daemon answered with a valid status payload, so it
+      // is alive BY DEFINITION here. Daemon/MCP liveness must NOT be gated on
+      // s.running (= cdpConnected, the Chrome/CDP browser link) — closing Chrome
+      // leaves the daemon perfectly healthy. The browser/CDP state is surfaced
+      // separately by the Desktop-tools indicator (dtBridge*) below. (getJson
+      // doesn't check res.ok, so validate the payload shape, not just "no throw".)
+      var daemonAlive = !!(s && s.engine === 'empir3-bridge');
+      setText('teleDaemonVal', daemonAlive ? 'RUNNING' : 'OFFLINE');
       setText('teleDaemonSub', (s.pid ? 'PID ' + s.pid + ' · ' : '') + 'uptime ' + formatUptime(uptimeMs));
-      var dled = $('teleDaemonLed'); if (dled){ dled.classList.remove('warn','bad','idle'); if (!s.running) dled.classList.add('bad'); }
+      var dled = $('teleDaemonLed'); if (dled){ dled.classList.remove('warn','bad','idle'); if (!daemonAlive) dled.classList.add('bad'); }
       // Desktop tools harness telemetry
       setText('dtBridgeStatus', s.running ? 'Connected' : 'Disconnected');
       setMetricTone('dtBridgeStatus', s.running ? 'good' : 'bad');
@@ -1471,15 +1576,18 @@
       var healthTag = $('daemonHealthTag');
       if (healthTag) {
         healthTag.classList.remove('good','warn','bad');
-        if (s.running) { healthTag.classList.add('good'); healthTag.textContent = 'HEALTHY'; }
+        if (daemonAlive) { healthTag.classList.add('good'); healthTag.textContent = 'HEALTHY'; }
         else { healthTag.classList.add('bad'); healthTag.textContent = 'OFFLINE'; }
       }
       // Rail foot
       setText('footDaemonUptime', formatUptime(uptimeMs));
-      var fdLed = $('footDaemonLed'); if (fdLed){ fdLed.classList.remove('warn','bad'); if (!s.running) fdLed.classList.add('bad'); }
-      // MCP cell (we treat MCP as ready if daemon is running; calls counted from /api/actions)
-      setText('teleMcpVal', s.running ? 'READY' : 'OFFLINE');
-      var mled = $('teleMcpLed'); if (mled){ mled.classList.remove('warn','bad'); if (!s.running) mled.classList.add('bad'); }
+      var fdLed = $('footDaemonLed'); if (fdLed){ fdLed.classList.remove('warn','bad'); if (!daemonAlive) fdLed.classList.add('bad'); }
+      var fmLed = $('footMcpLed'); if (fmLed){ fmLed.classList.remove('warn','bad'); if (!daemonAlive) fmLed.classList.add('bad'); }
+      // MCP cell — the stdio MCP server IS the daemon, so MCP is READY whenever
+      // the daemon is reachable (NOT gated on the browser/CDP link). Calls are
+      // counted from /api/actions.
+      setText('teleMcpVal', daemonAlive ? 'READY' : 'OFFLINE');
+      var mled = $('teleMcpLed'); if (mled){ mled.classList.remove('warn','bad'); if (!daemonAlive) mled.classList.add('bad'); }
       // Relay
       var rConn = !!(rs.relay && rs.relay.connected);
       var rPaired = !!rs.hasAuth;
@@ -1521,9 +1629,20 @@
         document.body.dataset.view = 'signedout';
       }
     } catch (e) {
-      // Daemon unreachable
+      // Daemon unreachable — reset the ENTIRE daemon family to OFFLINE, not just
+      // the daemon pill. Leaving MCP / health / foot LEDs / uptime at their last
+      // good value would paint a half-green console over a dead daemon.
       setText('teleDaemonVal','OFFLINE');
-      var dled2 = $('teleDaemonLed'); if (dled2){ dled2.classList.add('bad'); }
+      var dled2 = $('teleDaemonLed'); if (dled2){ dled2.classList.remove('warn','idle'); dled2.classList.add('bad'); }
+      setText('teleMcpVal','OFFLINE');
+      var mled2 = $('teleMcpLed'); if (mled2){ mled2.classList.remove('warn'); mled2.classList.add('bad'); }
+      var healthTag2 = $('daemonHealthTag');
+      if (healthTag2) { healthTag2.classList.remove('good','warn'); healthTag2.classList.add('bad'); healthTag2.textContent = 'OFFLINE'; }
+      var fdLed2 = $('footDaemonLed'); if (fdLed2){ fdLed2.classList.remove('warn'); fdLed2.classList.add('bad'); }
+      var fmLed2 = $('footMcpLed'); if (fmLed2){ fmLed2.classList.remove('warn'); fmLed2.classList.add('bad'); }
+      setText('footDaemonUptime','—');
+      setText('daemonUptime','—');
+      setText('ovDaemonUptime','—');
       setText('dtBridgeStatus','Disconnected');
       setMetricTone('dtBridgeStatus','bad');
       var dtTag2 = $('dtBridgeTag'); if (dtTag2) { dtTag2.textContent = 'OFFLINE'; dtTag2.className = 'tag bad'; }
@@ -1588,7 +1707,7 @@
       setText('focusStatusText', has ? 'Region locked — agent scoped to it.' : 'No region — agent sees full virtual screen');
       setText('focusTtl', has && j.ttlMs ? Math.round(j.ttlMs/1000) + 's' : '—');
       setText('focusBounds', has && j.region ? (j.region.width + '×' + j.region.height + ' @ (' + j.region.x + ',' + j.region.y + ')') : '—');
-      var rel = $('agtReleaseFocus'); if (rel) rel.disabled = !has;
+      var rel = $('agtReleaseFocus'); if (rel) rel.disabled = false;
       var grid = $('agtFocusGrid'); if (grid) grid.disabled = !has;
       // Sync the focus-grid button label with the daemon's authoritative
       // state. Without this the boot label always reads "Show focus grid"
@@ -1741,8 +1860,158 @@
       throw e;
     }
   }
+  var DESKTOP_MONITORS = [];
+  function setSetupItem(key, done, detail) {
+    var item = $('setupItem' + key);
+    if (item) {
+      item.classList.toggle('done', !!done);
+      item.classList.toggle('warn', !done);
+    }
+    var text = $('setup' + key + 'Text');
+    if (text) text.textContent = detail;
+  }
+  async function refreshSetupStatus() {
+    try {
+      var j = await postJson('/api/command', { type:'bridge_setup_status' });
+      var s = j && (j.result || j);
+      var cur = (s && s.current) || {};
+      var saved = (s && s.saved) || {};
+      setSetupItem('Overlay', !!cur.overlay, cur.overlay ? 'Chat bubble/overlay is available.' : 'Overlay is not connected yet.');
+      setSetupItem('Monitors', !!cur.monitors, (s.monitors && s.monitors.count ? (s.monitors.count + ' monitor(s): ' + (s.monitors.ids || []).join(', ')) : 'No monitors detected yet.'));
+      setSetupItem('Calibration', !!cur.calibration, cur.calibration ? 'Saved click calibration found.' : 'Run calibration before first agent use.');
+      setSetupItem('Recordings', !!cur.recordings, 'Record/playback endpoints are available.');
+      var tag = $('setupTag');
+      if (tag) {
+        tag.className = 'tag ' + (saved.completed ? 'good' : (s.completeNow ? 'warn' : 'bad'));
+        tag.textContent = saved.completed ? 'SAVED' : (s.completeNow ? 'READY TO SAVE' : 'CHECK REQUIRED');
+      }
+      setStatus('setupStatus', saved.completed ? ('Saved ' + (saved.completedAt || '').slice(0, 16).replace('T',' ')) : 'Complete the checks, then save setup.', saved.completed ? 'ok' : 'info');
+      return s;
+    } catch (e) {
+      setStatus('setupStatus', 'Setup status failed: ' + e.message, 'err');
+      return null;
+    }
+  }
+  async function refreshMonitors(showStatus) {
+    try {
+      if (showStatus) setStatus('calStatus', 'Detecting monitors...', 'info');
+      var j = await postJson('/api/command', { type:'desktop_monitors' });
+      var result = j && (j.result || j);
+      DESKTOP_MONITORS = Array.isArray(result.monitors) ? result.monitors : [];
+      var sel = $('agtCalMonitor');
+      if (sel) {
+        var current = sel.value || 'primary';
+        sel.innerHTML = '<option value="primary">Primary monitor</option><option value="all">All monitors</option>';
+        DESKTOP_MONITORS.forEach(function(m){
+          var b = m.bounds || {};
+          var opt = document.createElement('option');
+          opt.value = m.id;
+          opt.textContent = m.id + (m.primary ? ' (primary)' : '') + ' - ' + (b.width || '?') + 'x' + (b.height || '?') + ' @ ' + (b.x || 0) + ',' + (b.y || 0);
+          sel.appendChild(opt);
+        });
+        if ([].slice.call(sel.options).some(function(o){ return o.value === current; })) sel.value = current;
+      }
+      setText('calMonitorSummary', DESKTOP_MONITORS.length ? DESKTOP_MONITORS.map(function(m){ return m.id + (m.primary ? '*' : ''); }).join(', ') : '-');
+      if (showStatus) setStatus('calStatus', DESKTOP_MONITORS.length + ' monitor(s) detected.', 'ok');
+      refreshSetupStatus();
+      return DESKTOP_MONITORS;
+    } catch (e) {
+      if (showStatus) setStatus('calStatus', 'Monitor detection failed: ' + e.message, 'err');
+      return [];
+    }
+  }
+  async function refreshRecordingStatus() {
+    try {
+      var s = await getJson('/api/recording-status');
+      setText('recState', s.recording ? 'Recording' : 'Idle');
+      setText('recActionCount', s.actionCount || 0);
+      setText('recPlayState', s.playing ? 'Playing' : 'Ready');
+      var tag = $('recordingTag');
+      if (tag) { tag.textContent = s.recording ? 'RECORDING' : (s.playing ? 'PLAYING' : 'IDLE'); tag.className = 'tag ' + (s.recording ? 'bad' : (s.playing ? 'warn' : '')); }
+    } catch (_) {}
+  }
+  async function refreshRecordings(showStatus) {
+    try {
+      var rows = await getJson('/api/recordings');
+      var sel = $('recSelect');
+      if (sel) {
+        var current = sel.value;
+        sel.innerHTML = '';
+        if (!rows.length) {
+          var empty = document.createElement('option'); empty.value = ''; empty.textContent = 'No recordings saved'; sel.appendChild(empty);
+        } else {
+          rows.forEach(function(r){
+            var opt = document.createElement('option');
+            opt.value = r.name;
+            opt.textContent = r.name + ' - ' + (r.actionCount || 0) + ' action(s)';
+            sel.appendChild(opt);
+          });
+          if ([].slice.call(sel.options).some(function(o){ return o.value === current; })) sel.value = current;
+        }
+      }
+      setText('recSavedCount', rows.length || 0);
+      if (showStatus) setStatus('recStatus', rows.length + ' recording(s) loaded.', 'ok');
+      refreshSetupStatus();
+      return rows;
+    } catch (e) {
+      if (showStatus) setStatus('recStatus', 'Could not load recordings: ' + e.message, 'err');
+      return [];
+    }
+  }
+  async function loadSelectedRecording() {
+    var sel = $('recSelect');
+    var name = sel && sel.value;
+    if (!name) { setStatus('recStatus', 'Select a recording first.', 'err'); return; }
+    try {
+      var rec = await getJson('/api/recordings/' + encodeURIComponent(name));
+      var preview = {
+        name: rec.name,
+        startUrl: rec.startUrl,
+        recorded: rec.recorded,
+        actionCount: Array.isArray(rec.actions) ? rec.actions.length : 0,
+        variables: rec.variables || [],
+        actions: (rec.actions || []).slice(0, 12),
+      };
+      var out = $('recPreview');
+      if (out) { out.style.display = 'block'; out.textContent = JSON.stringify(preview, null, 2); }
+      setStatus('recStatus', 'Recording loaded.', 'ok');
+    } catch (e) {
+      setStatus('recStatus', 'Load failed: ' + e.message, 'err');
+    }
+  }
+  $('setupInjectOverlay').addEventListener('click', async function(){
+    setStatus('setupStatus', 'Injecting overlay chat...', 'info');
+    try {
+      await postJson('/api/command', { type:'bridge_overlay_reinject', reason:'setup' });
+      setStatus('setupStatus', 'Overlay chat injected.', 'ok');
+      refreshStatus(); refreshSetupStatus();
+    } catch (e) { setStatus('setupStatus', 'Overlay injection failed: ' + e.message, 'err'); }
+  });
+  $('setupDetectMonitors').addEventListener('click', function(){ refreshMonitors(true); });
+  $('setupCalibratePrimary').addEventListener('click', async function(){
+    setStatus('setupStatus', 'Calibration started on primary monitor.', 'info');
+    try {
+      await postJson('/api/command', { type:'desktop_calibrate_pointer', monitor:'primary', area:'monitor' });
+      setStatus('setupStatus', 'Primary monitor calibration saved.', 'ok');
+      refreshCalibration(); refreshSetupStatus();
+    } catch (e) { setStatus('setupStatus', 'Calibration failed: ' + e.message, 'err'); }
+  });
+  $('setupSaveComplete').addEventListener('click', async function(){
+    setStatus('setupStatus', 'Saving setup...', 'info');
+    try {
+      var s = await postJson('/api/command', { type:'bridge_setup_status' });
+      var status = s && (s.result || s);
+      await postJson('/api/settings/state', { bridge: { desktopSetup: { completed:true, checklist:(status && status.current) || {}, snapshot:status || {} } } });
+      setStatus('setupStatus', 'Setup saved for MCP and empir3 agents.', 'ok');
+      refreshSetupStatus();
+    } catch (e) { setStatus('setupStatus', 'Save failed: ' + e.message, 'err'); }
+  });
   $('dtOpenDesktopTest').addEventListener('click', function(){
     runDesktopCommand('Opening desktop test', { type:'navigate', url: location.origin + '/desktop-test' }, { show:false, done:'Desktop test opened.' });
+  });
+  $('dtOpenAccuracyLab').addEventListener('click', function(){
+    window.open(location.origin + '/accuracy-lab', '_blank');
+    setStatus('desktopToolsStatus', 'Accuracy Lab opened in a new tab.', 'ok');
   });
   $('dtBrowserScreenshot').addEventListener('click', function(){
     runDesktopCommand('Browser screenshot', { type:'screenshot' });
@@ -1754,13 +2023,12 @@
     runDesktopCommand('Interactive snapshot', { type:'snapshot', filter:'interactive', format:'compact' });
   });
   $('dtInjectOverlay').addEventListener('click', async function(){
-    setStatus('desktopToolsStatus','Injecting overlay…','info');
-    try {
-      var script = await (await fetch('/overlay.js')).text();
-      await runDesktopCommand('Inject overlay', { type:'evaluate', script: script }, { show:false, done:'Overlay injected.' });
-    } catch (e) {
-      setStatus('desktopToolsStatus','Inject overlay failed: ' + e.message,'err');
-    }
+    try { await runDesktopCommand('Inject overlay', { type:'bridge_overlay_reinject', reason:'desktop-tools' }, { done:'Overlay injected and verified.' }); refreshSetupStatus(); }
+    catch (_) {}
+  });
+  $('dtOpenToolbar').addEventListener('click', async function(){
+    try { await runDesktopCommand('Open floating toolbar', { type:'desktop_toolbar', action:'show' }, { show:false, done:'Floating toolbar opened.' }); }
+    catch (_) {}
   });
   $('dtRevokeControl').addEventListener('click', async function(){
     if (!confirm('Disable browser interact, desktop, eval, and recording tools?')) return;
@@ -1776,6 +2044,44 @@
     }
   });
 
+  $('recStart').addEventListener('click', async function(){
+    setStatus('recStatus', 'Starting recording...', 'info');
+    try {
+      var j = await postJson('/api/command', { type:'record_start' });
+      showDesktopOutput('Recording start', j && (j.result || j));
+      setStatus('recStatus', 'Recording started.', 'ok');
+      refreshRecordingStatus(); refreshSetupStatus();
+    } catch (e) { setStatus('recStatus', 'Start failed: ' + e.message, 'err'); }
+  });
+  $('recStop').addEventListener('click', async function(){
+    var name = ($('recName').value || '').trim() || ('recording-' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-'));
+    setStatus('recStatus', 'Stopping recording...', 'info');
+    try {
+      var j = await postJson('/api/command', { type:'record_stop', text:name });
+      var result = j && (j.result || j);
+      showDesktopOutput('Recording stop', result);
+      setStatus('recStatus', 'Saved ' + (result.saved || name) + '.', 'ok');
+      $('recName').value = '';
+      refreshRecordingStatus(); refreshRecordings(); refreshSetupStatus();
+    } catch (e) { setStatus('recStatus', 'Stop failed: ' + e.message, 'err'); }
+  });
+  $('recRefresh').addEventListener('click', function(){ refreshRecordings(true); });
+  $('recLoad').addEventListener('click', loadSelectedRecording);
+  $('recPlay').addEventListener('click', async function(){
+    var sel = $('recSelect');
+    var name = sel && sel.value;
+    if (!name) { setStatus('recStatus', 'Select a recording first.', 'err'); return; }
+    setStatus('recStatus', 'Playing recording...', 'info');
+    try {
+      var j = await postJson('/api/command', { type:'play', recording:name, speed:1, variables:{} });
+      var result = j && (j.result || j);
+      var out = $('recPreview');
+      if (out) { out.style.display = 'block'; out.textContent = JSON.stringify(result, null, 2); }
+      setStatus('recStatus', 'Playback complete.', 'ok');
+      refreshRecordingStatus();
+    } catch (e) { setStatus('recStatus', 'Playback failed: ' + e.message, 'err'); refreshRecordingStatus(); }
+  });
+
   $('agtSelectRegion').addEventListener('click', async function(){
     setStatus('agentStatus','Drag a region on screen — bridge waits up to 2 minutes.','info');
     try {
@@ -1784,12 +2090,12 @@
       if (region) setStatus('agentStatus','Region set: ' + region.width + '×' + region.height + ' at (' + region.x + ',' + region.y + ').','ok');
       else if (j && j.result && j.result.cancelled) setStatus('agentStatus','Region selection cancelled.','info');
       else setStatus('agentStatus','Region selection finished.','ok');
-      refreshFocus();
+      refreshFocus(); refreshSetupStatus();
     } catch (e) { setStatus('agentStatus','Select region failed: ' + e.message,'err'); }
   });
   $('agtReleaseFocus').addEventListener('click', async function(){
     setStatus('agentStatus','Releasing focus…','info');
-    try { await postJson('/api/command', { type:'desktop_release_focus' }); setStatus('agentStatus','Agent focus released.','ok'); refreshFocus(); }
+    try { await postJson('/api/command', { type:'desktop_release_focus' }); setStatus('agentStatus','Agent focus and screen artifacts released.','ok'); refreshFocus(); refreshSetupStatus(); }
     catch (e) { setStatus('agentStatus','Release failed: ' + e.message,'err'); }
   });
   var focusGridOn = false;
@@ -1802,20 +2108,25 @@
       setStatus('agentStatus','Focus grid ' + (focusGridOn ? 'visible.' : 'hidden.'),'ok');
     } catch (e) { setStatus('agentStatus','Focus grid toggle failed: ' + e.message,'err'); }
   });
+  $('agtDetectMonitors').addEventListener('click', function(){ refreshMonitors(true); });
   $('agtCalibrate').addEventListener('click', async function(){
-    setStatus('calStatus','Calibration started — click the ghost cursor when it appears (60s).','info');
+    var sel = $('agtCalMonitor');
+    var mon = (sel && sel.value) || 'primary';
+    var area = mon === 'all' ? 'all' : 'monitor';
+    setStatus('calStatus','Calibration started for ' + mon + '.','info');
     try {
-      var j = await postJson('/api/command', { type:'desktop_calibrate_pointer' });
+      var j = await postJson('/api/command', { type:'desktop_calibrate_pointer', monitor:mon, area:area });
       if (j && j.result && j.result.cancelled) { setStatus('calStatus','Calibration cancelled.','info'); return; }
-      var cal = j && j.result && j.result.calibration;
-      if (cal) {
-        var dx = cal.offsetX|0, dy = cal.offsetY|0;
-        setText('calOffsetX', (dx>=0?'+':'') + dx + ' px');
-        setText('calOffsetY', (dy>=0?'+':'') + dy + ' px');
-        setText('calLastRun', new Date().toISOString().slice(0,16).replace('T',' '));
-        var tag = $('calibrationTag'); if (tag){ tag.textContent = 'CALIBRATED'; tag.className = 'tag good'; }
-        setStatus('calStatus','Saved.','ok');
-      }
+      setStatus('calStatus','Calibration saved.','ok');
+      refreshCalibration(); refreshSetupStatus();
+    } catch (e) { setStatus('calStatus','Calibration failed: ' + e.message,'err'); }
+  });
+  $('agtCalibrateAll').addEventListener('click', async function(){
+    setStatus('calStatus','Calibration started for all monitors.','info');
+    try {
+      await postJson('/api/command', { type:'desktop_calibrate_pointer', monitor:'all', area:'all' });
+      setStatus('calStatus','All monitor calibration saved.','ok');
+      refreshCalibration(); refreshSetupStatus();
     } catch (e) { setStatus('calStatus','Calibration failed: ' + e.message,'err'); }
   });
 
@@ -1944,19 +2255,32 @@
   async function refreshCalibration() {
     try {
       var j = await postJson('/api/command', { type: 'desktop_calibration_status' });
-      var cal = j && j.result && (j.result.calibration || j.result);
-      var hasCal = cal && (cal.offsetX != null || cal.offsetY != null);
+      var result = j && (j.result || j);
+      var cal = result && result.calibration;
+      var monitorIds = (result && result.monitors) || (cal && cal.monitors ? Object.keys(cal.monitors) : []);
+      var hasCal = !!(result && result.applied);
       var tag = $('calibrationTag');
       if (hasCal) {
-        var dx = cal.offsetX|0, dy = cal.offsetY|0;
-        setText('calOffsetX', (dx>=0?'+':'') + dx + ' px');
-        setText('calOffsetY', (dy>=0?'+':'') + dy + ' px');
-        if (cal.updatedAt) setText('calLastRun', String(cal.updatedAt).slice(0,16).replace('T',' '));
+        if (cal && cal.version === 2 && cal.monitors) {
+          var rows = Object.keys(cal.monitors).map(function(id){ var m = cal.monitors[id] || {}; return id + (m.residualPx != null ? ' (' + m.residualPx + 'px)' : ''); });
+          setText('calOffsetX', 'per-monitor');
+          setText('calOffsetY', 'affine fit');
+          setText('calMonitorSummary', rows.join(', '));
+          if (cal.capturedAt) setText('calLastRun', String(cal.capturedAt).slice(0,16).replace('T',' '));
+        } else {
+          var dx = cal && (cal.offsetX|0), dy = cal && (cal.offsetY|0);
+          setText('calOffsetX', (dx>=0?'+':'') + dx + ' px');
+          setText('calOffsetY', (dy>=0?'+':'') + dy + ' px');
+          setText('calMonitorSummary', monitorIds.length ? monitorIds.join(', ') : 'legacy');
+          if (cal && cal.updatedAt) setText('calLastRun', String(cal.updatedAt).slice(0,16).replace('T',' '));
+        }
         if (tag) { tag.textContent = 'CALIBRATED'; tag.className = 'tag good'; }
       } else {
         setText('calOffsetX', '—'); setText('calOffsetY', '—'); setText('calLastRun', '—');
+        if (!DESKTOP_MONITORS.length) setText('calMonitorSummary', '—');
         if (tag) { tag.textContent = 'UNCALIBRATED'; tag.className = 'tag'; }
       }
+      refreshSetupStatus();
     } catch (_) { /* read-only call; ignore if denied */ }
   }
 
@@ -1970,6 +2294,7 @@
     { id:'codex',      label:'OpenAI Codex',     vendor:'OpenAI',    lendable:true, settingsKey:'lendOpenAiCodex',   keyField:'apiKeyOpenai',    keyVendor:'openai' },
     { id:'gemini',     label:'Gemini CLI',       vendor:'Google',    lendable:true, settingsKey:'lendGoogleGemini',  keyField:'apiKeyGoogle',    keyVendor:'google' },
     { id:'grok',       label:'Grok Build CLI',   vendor:'xAI',       lendable:true, settingsKey:'lendXaiGrok',       keyField:'apiKeyXai',       keyVendor:'xai' },
+    { id:'agy',        label:'Antigravity',      vendor:'Google',    lendable:true, settingsKey:'lendGoogleAntigravity' },
     { id:'higgsfield', label:'Higgsfield CLI',   vendor:'Higgsfield',lendable:false, handlerKey:'higgsfield' },
     { id:'github',     label:'GitHub CLI',       vendor:'GitHub',    lendable:true, settingsKey:'lendGitHubCli', ghScopes:true },
   ];
@@ -2033,7 +2358,9 @@
       }
       var authBtn = installed
         ? '<button class="btn small" type="button" data-cli-auth="' + row.id + '">' + (authed ? 'Re-auth' : 'Authenticate') + '</button>'
-        : '<span style="font-size:11.5px; color:var(--soft);">install first</span>';
+        : (p.install
+          ? '<button class="btn small" type="button" data-cli-install="' + row.id + '">Install</button>'
+          : '<span style="font-size:11.5px; color:var(--soft);">install first</span>');
       html += '<tr>' +
         '<td class="col-nm"><div style="font-weight:600;">' + escapeHtml(row.label) + '</div><div style="font-size:11.5px; color:var(--soft);">' + escapeHtml(row.vendor) + (p.path ? ' · ' + escapeHtml(shortPath(p.path)) : '') + '</div></td>' +
         '<td>' + installTag + '</td>' +
@@ -2041,6 +2368,21 @@
         '<td>' + toggleCell + '</td>' +
         '<td>' + authBtn + '</td>' +
         '</tr>';
+      // NOT INSTALLED: full-width helper row with the install command (copy),
+      // a Get-it link to the official page, and any caveat note. The "Install"
+      // button in the Action column runs the same command in a console.
+      if (!installed && p.install) {
+        html += '<tr class="cli-install-row"><td colspan="5" style="padding:2px 14px 14px 14px;">' +
+          '<div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">' +
+            '<span style="font-size:11.5px; color:var(--soft);">Get it:</span>' +
+            '<code style="font-size:12px; background:var(--card2,rgba(255,255,255,0.04)); border:1px solid var(--line); border-radius:6px; padding:4px 8px; user-select:all;">' + escapeHtml(p.install.command) + '</code>' +
+            '<button class="btn small ghost" type="button" data-install-copy="' + escapeAttr(p.install.command) + '">Copy</button>' +
+            '<a href="' + escapeAttr(p.install.docsUrl) + '" target="_blank" rel="noopener noreferrer" style="font-size:12px; color:var(--accent); text-decoration:underline;">Official page ↗</a>' +
+            '<span style="font-size:11px; color:var(--soft);">or just tell your agent to install it</span>' +
+          '</div>' +
+          (p.install.note ? '<div style="font-size:11px; color:var(--soft); margin-top:6px;">' + escapeHtml(p.install.note) + '</div>' : '') +
+        '</td></tr>';
+      }
       // GitHub CLI: when the master lend is on, render the fine-grained
       // scope matrix as a full-width sub-row directly beneath it.
       if (row.ghScopes && !!bridge.lendGitHubCli) {
@@ -2106,6 +2448,16 @@
     });
     document.querySelectorAll('[data-cli-auth]').forEach(function(btn){
       btn.addEventListener('click', function(){ onCliAuthClick(btn.dataset.cliAuth); });
+    });
+    document.querySelectorAll('[data-cli-install]').forEach(function(btn){
+      btn.addEventListener('click', function(){ onCliInstallClick(btn.dataset.cliInstall); });
+    });
+    document.querySelectorAll('[data-install-copy]').forEach(function(btn){
+      btn.addEventListener('click', async function(){
+        var cmd = btn.dataset.installCopy;
+        try { await navigator.clipboard.writeText(cmd); setStatus('cliStatus', 'Copied: ' + cmd, 'ok'); }
+        catch (e) { setStatus('cliStatus', 'Copy this command: ' + cmd, 'info'); }
+      });
     });
     // Wire the "configure" link inside the cell summary — jump to
     // Permissions and pre-select the matching family filter button.
@@ -2224,6 +2576,20 @@
     }
   }
 
+  async function onCliInstallClick(id) {
+    setStatus('cliStatus', 'Launching ' + id + ' installer…', 'info');
+    try {
+      var j = await postJson('/api/cli/install', { provider: id });
+      if (j && j.launched) {
+        setStatus('cliStatus', id + ' installer opened in a new console — watch it finish, then click Re-scan.', 'ok');
+      } else if (j && j.error) {
+        setStatus('cliStatus', 'Install failed: ' + j.error, 'err');
+      }
+    } catch (e) {
+      setStatus('cliStatus', 'Install call failed: ' + e.message, 'err');
+    }
+  }
+
   async function loadCliState() {
     try {
       var s = await getJson('/api/settings/state');
@@ -2290,6 +2656,14 @@
   function closeProviderModal() {
     var m = $('providerModal'); if (m) m.style.display = 'none';
   }
+  var rescanBtn = $('rescanClisBtn');
+  if (rescanBtn) rescanBtn.addEventListener('click', async function(){
+    setStatus('cliStatus', 'Re-scanning installed CLIs…', 'info');
+    // Force a fresh probe (bypass the server-side CLI-probe cache), then render.
+    try { await getJson('/api/settings/state?fresh=1'); } catch (e) {}
+    await loadCliState();
+    setStatus('cliStatus', 'Re-scan complete.', 'ok');
+  });
   var addBtn = $('addCustomProviderBtn');
   if (addBtn) addBtn.addEventListener('click', openProviderModal);
   var closeBtn = $('providerModalClose');
@@ -2344,9 +2718,14 @@
   refreshActions();
   refreshFocus();
   refreshCalibration();
+  refreshMonitors(false);
+  refreshRecordings(false);
+  refreshRecordingStatus();
+  refreshSetupStatus();
   setInterval(refreshStatus, 5000);
   setInterval(refreshActions, 8000);
   setInterval(refreshFocus, 6000);
+  setInterval(refreshRecordingStatus, 3000);
   setInterval(loadCliState, 15000);
   setInterval(refreshSettingsIfQuiet, 10000);
 </script>
