@@ -1,0 +1,96 @@
+{
+  "name": "@empir3/empir3-bridge",
+  "version": "0.3.29",
+  "description": "Local-first browser and desktop control bridge for AI agents using MCP.",
+  "license": "MIT",
+  "author": "Empir3",
+  "homepage": "https://github.com/empir3hq/empir3-bridge",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/empir3hq/empir3-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/empir3hq/empir3-bridge/issues"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "browser",
+    "desktop-automation",
+    "automation",
+    "chrome",
+    "cdp",
+    "computer-use",
+    "mcp-server",
+    "ai-tools",
+    "local-first"
+  ],
+  "bin": {
+    "empir3-bridge": "./src/launch.js",
+    "empir3-bridge-mcp": "./src/mcp-entry.js"
+  },
+  "main": "./src/cli.ts",
+  "scripts": {
+    "start": "node src/launch.js",
+    "kill": "node src/launch.js --kill",
+    "status": "node src/launch.js --status",
+    "cli": "tsx src/cli.ts",
+    "mcp": "tsx src/mcp-server.ts",
+    "build:mcp": "esbuild src/mcp-server.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/mcp-server.cjs --external:@modelcontextprotocol/sdk --external:zod",
+    "release:check": "node build/build.js --check",
+    "build:windows": "node build/build.js",
+    "build:release": "node build/build.js",
+    "test:bootstrap": "node scripts/bootstrap-e2e.mjs",
+    "test:bootstrap-go": "cd build/bootstrap-go && go test ./...",
+    "publish:downloads": "node scripts/publish-downloads.mjs",
+    "certify:bridge": "node scripts/certify-bridge.mjs",
+    "smoke:companion": "node scripts/check-companion-surface.mjs",
+    "smoke:live": "node scripts/smoke-live-bridge.mjs",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "node-pty": "^1.1.0",
+    "tsx": "^4.20.0",
+    "ws": "^8.21.0",
+    "zod": "^3.25.76"
+  },
+  "overrides": {
+    "express-rate-limit": "^8.5.2",
+    "fast-uri": "^3.1.2",
+    "hono": "^4.12.23",
+    "ip-address": "^10.2.0",
+    "qs": "^6.15.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "src/",
+    "assets/",
+    "build/bootstrap.js",
+    "build/build.js",
+    "build/payload-entry.js",
+    "build/payload-signing-pub.json",
+    "installer/",
+    "tray/",
+    "scripts/",
+    "docs/AGENT_GUIDE.md",
+    "docs/RELEASE.md",
+    "docs/SAFETY.md",
+    "docs/TESTING.md",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md"
+  ]
+}
