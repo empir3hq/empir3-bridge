@@ -41,7 +41,9 @@ Codex writes under your OpenAI seat. Gemini reviews under your Google seat. The 
 
 ## See it in action
 
-<!-- DRAG empir3-bridge-commercial-60s-github.mp4 HERE in the GitHub web editor - it becomes a user-attachments URL that renders as a player -->
+
+https://github.com/user-attachments/assets/8f39b9a1-2df4-453e-8703-2f949d37d4a5
+
 
 <sub>Browser use, computer use, and multi-model orchestration — your subscriptions, your machine, no paywall.</sub>
 
