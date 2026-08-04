@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [18, 20]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Build MCP server bundle
+        run: npm run build:mcp
+
+      # Runs on all three OSes. The credential-mode assertions are POSIX-only
+      # and self-skip on Windows, so the ubuntu/macos lanes are what actually
+      # guard the 0600 bridge-auth.json contract.
+      #
+      # shell: bash is deliberate — the test glob is expanded by the SHELL, not
+      # by node. Node's own glob support landed after 18, and passing a bare
+      # directory stopped scanning in 24, so shell expansion is the only form
+      # that behaves identically across the whole 18→24 matrix. bash ships on
+      # the windows-latest runner, so this is portable.
+      - name: Unit tests
+        shell: bash
+        run: npm test
