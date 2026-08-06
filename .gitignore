@@ -1,0 +1,66 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.env
+.env.local
+.vscode/
+.idea/
+*.swp
+*.swo
+__pycache__/
+*.py[cod]
+recordings/
+feedback/
+chrome-profile/
+.empir3-bridge/
+!desktop-shell/package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Release build output and private signing keys
+build/dist/
+build/check/
+build/payload-staging/
+build/node-staging/
+# Pinned Node upstream zip cache (re-downloaded + sha-verified on demand)
+build/node-cache/
+build/pyinstaller-work/
+build/pyinstaller-spec/
+build/bundle-bootstrap.js
+build/sea-config.json
+build/sea-prep.blob
+build/*.pem
+*.spec
+
+# Internal launch scaffolding — not for public consumption
+LAUNCH_PLAN.md
+
+# Smoke-matrix output directories
+build/smoke-all-*/
+
+# FinishLine session evidence (release-proof artifacts, not source)
+build/finishline-evidence/
+BRIDGE_FINISHLINE_LOG.md
+
+# Stray `go build ./...` output in the bootstrap-go package (real build → build/dist/Empir3Setup.exe)
+build/bootstrap-go/empir3bootstrap.exe
+
+# Curated public snapshot produced by scripts/export-public.mjs (for empir3hq import)
+build/public-export/
+build/public-export.tar
+
+# Cross-platform Electron shell build output
+desktop-shell/out/
+desktop-shell/.runtime/
+
+# Locally collected/staged cross-platform release evidence. These directories
+# preserve signed receipts and rollback bytes, but are generated artifacts and
+# must never be committed.
+build/release-*-production-index.json
+build/release-*-production-stage/
+build/release-*-receipts/
+build/release-*-rollback-fixture/
+
+# Trusted Signing local tooling (recreate with build/signing/setup-tools.ps1)
+build/signing/tools/
