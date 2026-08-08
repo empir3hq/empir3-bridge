@@ -1,0 +1,268 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Routine pushes and PR updates supersede older checks on the same ref. A
+# deliberately dispatched release gate has its own event group and is never
+# cancelled halfway through packaging.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  fast-check:
+    name: Fast check (Linux, Node 20)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Build MCP server bundle
+        run: npm run build:mcp
+
+      - name: Unit tests
+        run: npm test
+
+  compatibility:
+    name: Compatibility (${{ matrix.os }}, Node ${{ matrix.node }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [18, 20]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Build MCP server bundle
+        run: npm run build:mcp
+
+      # The test runner enumerates files before invoking Node, so this behaves
+      # identically under cmd.exe, PowerShell, and POSIX shells on Node 18+.
+      # Credential-mode assertions self-skip on Windows; Ubuntu/macOS guard the
+      # 0600 bridge-auth.json contract.
+      - name: Unit tests
+        run: npm test
+
+  desktop-shell:
+    name: Desktop shell (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      # Pure shell checks do not need to download or launch Electron. Runtime
+      # window smokes remain explicit release-gate jobs on real target hosts.
+      - name: Install desktop shell dependencies
+        run: npm ci --prefix desktop-shell --ignore-scripts --no-audit --no-fund
+
+      - name: Desktop shell checks
+        run: npm run desktop:test
+
+  desktop-packages:
+    name: Desktop package (${{ matrix.label }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            package_arch: x64
+          - label: macos-universal
+            os: macos-latest
+            package_arch: universal
+          - label: linux-x64
+            os: ubuntu-latest
+            package_arch: x64
+          - label: linux-arm64
+            os: ubuntu-24.04-arm
+            package_arch: arm64
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use Node.js 22.17
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.17.0
+
+      - name: Install Bridge dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Install desktop packaging dependencies
+        run: npm ci --prefix desktop-shell --no-audit --no-fund
+
+      - name: Install Linux package tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fakeroot dpkg rpm xvfb
+
+      # GitHub's x64 image includes Chrome, while the ARM64 image does not.
+      # Install a pinned full Chromium build so the installed-payload scale
+      # smoke proves a real headed CDP browser on both Linux architectures.
+      - name: Install Chromium for Linux ARM64 browser smoke
+        if: matrix.label == 'linux-arm64'
+        shell: bash
+        run: |
+          npx --yes playwright@1.62.1 install --with-deps chromium
+          chrome_path="$(find "$HOME/.cache/ms-playwright" -type f -name chrome -path '*/chromium-*/*' -executable -print -quit)"
+          test -n "$chrome_path"
+          echo "CHROME_PATH=$chrome_path" >> "$GITHUB_ENV"
+          echo "EMPIR3_CHROME_DISABLE_SANDBOX=1" >> "$GITHUB_ENV"
+
+      - name: Build native desktop artifacts
+        env:
+          EMPIR3_DESKTOP_ARCH: ${{ matrix.package_arch }}
+        run: npm run desktop:make
+
+      - name: Smoke packaged app
+        if: runner.os != 'Linux'
+        run: npm run desktop:package-smoke
+
+      - name: Smoke Windows installer lifecycle
+        if: runner.os == 'Windows'
+        run: npm run desktop:installer-smoke:windows
+
+      - name: Smoke macOS installer lifecycle
+        if: runner.os == 'macOS'
+        run: npm run desktop:installer-smoke:macos
+
+      - name: Smoke Linux installer lifecycle
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run desktop:installer-smoke:linux
+
+      - name: Smoke signed Linux update and rollback lifecycle
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run desktop:update-smoke:linux
+
+      - name: Smoke packaged app on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run desktop:package-smoke
+
+      - name: Smoke packaged MCP auto-launch
+        if: runner.os != 'Linux'
+        run: npm run desktop:mcp-smoke
+
+      - name: Smoke packaged MCP auto-launch on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run desktop:mcp-smoke
+
+      - name: Record artifact hashes
+        env:
+          EMPIR3_DESKTOP_ARCH: ${{ matrix.package_arch }}
+        run: npm run desktop:artifacts
+
+      - name: Build lightweight headless package
+        if: runner.os == 'Linux'
+        env:
+          EMPIR3_HEADLESS_ARCH: ${{ matrix.package_arch }}
+        run: |
+          bash -n headless-package/assets/install.sh
+          bash -n headless-package/assets/uninstall.sh
+          npm run headless:make
+
+      - name: Smoke lightweight headless package
+        if: runner.os == 'Linux'
+        run: npm run headless:smoke
+
+      - name: Upload unsigned test artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: empir3-bridge-${{ matrix.label }}-unsigned
+          path: |
+            desktop-shell/out/make/**
+            desktop-shell/out/artifacts.json
+            headless-package/out/*.tar.gz
+            headless-package/out/artifacts.json
+          if-no-files-found: error
+          retention-days: 14
+
+  desktop-artifact-index:
+    name: Universal desktop artifact index
+    if: github.event_name == 'workflow_dispatch'
+    needs: desktop-packages
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use Node.js 22.17
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.17.0
+
+      - name: Download every native package receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: empir3-bridge-*-unsigned
+          path: desktop-shell/out/native-receipts
+
+      - name: Build held universal artifact index
+        run: >-
+          npm run desktop:artifacts:index --
+          --receipts out/native-receipts
+          --out out/universal-artifact-index.json
+          --channel test
+          --rollout-state hold
+          --rollout-percent 0
+          --rollout-seed ci-${{ github.run_id }}
+          --health package-smoke-passed
+          --stage-dir out/universal-release
+
+      - name: Upload universal artifact index
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: empir3-bridge-universal-artifact-index
+          path: desktop-shell/out/universal-artifact-index.json
+          if-no-files-found: error
+          retention-days: 14
