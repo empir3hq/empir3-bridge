@@ -1,7 +1,7 @@
 {
   "name": "empir3-bridge-desktop",
   "productName": "Empir3 Bridge",
-  "version": "0.3.80",
+  "version": "0.3.83",
   "private": true,
   "description": "Cross-platform Electron lifecycle shell for the shared Empir3 Bridge engine.",
   "author": "Empir3",

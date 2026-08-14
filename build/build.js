@@ -214,7 +214,7 @@ function buildBootstrapExe(pubKeyHex) {
 
   // Authenticode BEFORE hashing — the signature changes the exe bytes, and the
   // version manifest + release docs must record the hash of what users download.
-  signBootstrapExe();
+  signWindowsExecutable(EXE_OUT, 'Empir3Setup.exe');
 
   const exeHash = sha256OfFile(EXE_OUT);
   const sz = (fs.statSync(EXE_OUT).size / 1024 / 1024).toFixed(1);
@@ -229,21 +229,21 @@ function buildBootstrapExe(pubKeyHex) {
 // tooling stay possible — missing tooling downgrades to a loud warning; set
 // EMPIR3_REQUIRE_SIGNED=1 (the release lane does) to make an unsigned exe a
 // build failure instead.
-function signBootstrapExe() {
+function signWindowsExecutable(exePath, label) {
   const required = process.env.EMPIR3_REQUIRE_SIGNED === '1';
   const skipped = (why) => {
     if (required) throw new Error(`EMPIR3_REQUIRE_SIGNED=1 but ${why}`);
-    step(`WARNING: ${why} — Empir3Setup.exe ships UNSIGNED (SmartScreen/Defender will flag it)`);
+    step(`WARNING: ${why} — ${label} ships UNSIGNED (SmartScreen/Defender may flag it)`);
   };
   if (process.platform !== 'win32') return skipped('Authenticode signing needs a Windows host');
   const toolsDir = path.join(BUILD_DIR, 'signing', 'tools');
   if (!fs.existsSync(toolsDir)) {
     return skipped('signing tooling missing (run build/signing/setup-tools.ps1 once)');
   }
-  step('Authenticode-signing Empir3Setup.exe (Azure Trusted Signing)...');
+  step(`Authenticode-signing ${label} (Azure Trusted Signing)...`);
   run('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-File', path.join(BUILD_DIR, 'signing', 'sign.ps1'), '-Path', EXE_OUT]);
-  step('Authenticode signature applied + verified');
+    '-File', path.join(BUILD_DIR, 'signing', 'sign.ps1'), '-Path', exePath]);
+  step(`${label} Authenticode signature applied + verified`);
 }
 
 // CI guard (Codex): the built exe MUST carry an asInvoker manifest and MUST
@@ -671,6 +671,12 @@ function buildTrayExe() {
     console.warn(`[build] WARN: PyInstaller reported success but ${TRAY_EXE} missing.`);
     return;
   }
+  // The tray is a downloaded executable too. Signing only the bootstrap left
+  // the PyInstaller one-file binary vulnerable to ML antivirus quarantine
+  // during payload extraction, which removed the tray icon while the daemon
+  // still reported the new version. Sign it before it is copied into the
+  // payload so every updater receives the exact verified Authenticode bytes.
+  signWindowsExecutable(TRAY_EXE, 'Empir3Tray.exe');
   const sz = (fs.statSync(TRAY_EXE).size / 1024 / 1024).toFixed(1);
   step(`Tray exe ready → ${path.relative(BRIDGE_DIR, TRAY_EXE)} (${sz} MB)`);
 }

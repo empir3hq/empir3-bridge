@@ -15,8 +15,8 @@
  *       surprises become a polish item.
  *   #2  Per-model param naming — handler is pass-through via `extra: {...}`.
  *       MCP-calling agent owns CLI flag naming, no translation here.
- *   #3  Concurrency — single-job FIFO queue at the handler level. Avoids
- *       CLI credential lock contention without per-model awareness.
+ *   #3  Concurrency — the Bridge provider-capacity gate owns admission. The
+ *       safe default is one, and the device owner can raise it deliberately.
  *   #4  Cost cap — none for v1. Per-tool permission (defaults OFF for
  *       _generate) + global execute gate carry the safety load.
  *   #5  Token re-auth — regex-scan stderr for known auth-error patterns,
@@ -295,14 +295,6 @@ async function fetchToArtifact(url: string): Promise<{ path: string; bytes: numb
   }
 }
 
-// Default #3 — single-job FIFO queue.
-let generateQueue: Promise<any> = Promise.resolve();
-function enqueueGenerate<T>(fn: () => Promise<T>): Promise<T> {
-  const next = generateQueue.then(fn, fn);
-  generateQueue = next.then(() => undefined, () => undefined);
-  return next;
-}
-
 // Default #9 — probe `generate --help` once, cache for the process lifetime.
 let listProbeCache: { subcommand: string[] | null; probedAt: number } | null = null;
 
@@ -386,7 +378,7 @@ export async function higgsfieldGenerate(params: HiggsfieldGenerateParams): Prom
     20,
   );
 
-  return enqueueGenerate(async () => {
+  return (async () => {
     mkdirSync(ARTIFACT_DIR, { recursive: true });
 
     let imagePath: string | null = null;
@@ -754,7 +746,14 @@ export async function higgsfieldModels(params: HiggsfieldModelsParams = {}): Pro
   const parsed = safeJsonParse(r.stdout);
   const models = Array.isArray(parsed)
     ? parsed
-        .map((m: any) => ({ job_set_type: m.job_set_type, name: m.display_name, type: m.type }))
+        // Higgsfield CLI 1.1.x renamed the identifier field from
+        // `job_set_type` to `job_type`. Keep our relay contract stable while
+        // accepting both CLI generations so older Bridge hosts still work.
+        .map((m: any) => ({
+          job_set_type: m.job_type ?? m.job_set_type,
+          name: m.display_name ?? m.name ?? m.job_type ?? m.job_set_type,
+          type: m.type,
+        }))
         .filter((m: any) => m.job_set_type)
     : [];
   modelsCache.set(cacheKey, { at: Date.now(), data: models });

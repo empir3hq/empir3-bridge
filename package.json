@@ -1,6 +1,6 @@
 {
   "name": "@empir3hq/empir3-bridge",
-  "version": "0.3.80",
+  "version": "0.3.83",
   "description": "Local-first browser and desktop control bridge for AI agents using MCP.",
   "license": "MIT",
   "author": "Empir3",
@@ -53,6 +53,7 @@
     "smoke:companion": "node scripts/check-companion-surface.mjs",
     "smoke:headless": "node scripts/smoke-headless.mjs",
     "smoke:live": "node scripts/smoke-live-bridge.mjs",
+    "stress:grok": "node scripts/stress-grok-concurrency.mjs",
     "smoke:calibration": "node scripts/smoke-calibration-workflow.mjs",
     "desktop:install": "npm --prefix desktop-shell install",
     "desktop:dev": "npm --prefix desktop-shell start",

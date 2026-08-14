@@ -79,6 +79,19 @@ import {
   unregisterOwnedCliProcess,
 } from './cli-process-tree.js';
 import { cleanupStaleGrokMcpSections, createGrokTurnIsolation } from './grok-turn-isolation.js';
+import {
+  classifyGrokAuthFailure,
+  invalidCliAuthLiveness,
+  normalizeCliAuthLivenessRecord,
+  unverifiedCliAuthLiveness,
+  verifiedCliAuthLiveness,
+} from './cli-auth-liveness.js';
+import {
+  MAX_PROVIDER_CONCURRENCY_LIMIT,
+  normalizeProviderConcurrencyLimit,
+  providerConcurrencyGate,
+  type ProviderConcurrencySnapshot,
+} from './provider-concurrency.js';
 import { trayConsumerActive, unavailableTrayCommandMessage } from './tray-command-state.js';
 import { localBrowserRequestTimeoutMs, shouldRetryLocalBrowserFetch } from './browser-request-policy.js';
 
@@ -861,6 +874,40 @@ function saveBridgeSettings(settings: any) {
   writeSecureJson(SETTINGS_FILE, settings, SETTINGS_BACKUP_FILE);
 }
 
+function grokAuthLiveness(settings: any = readBridgeSettings()) {
+  return normalizeCliAuthLivenessRecord(settings?.cliAuthLiveness?.grok);
+}
+
+function saveGrokAuthLiveness(record: ReturnType<typeof normalizeCliAuthLivenessRecord>): boolean {
+  try {
+    const settings = readBridgeSettings();
+    settings.cliAuthLiveness = {
+      ...(settings.cliAuthLiveness && typeof settings.cliAuthLiveness === 'object' ? settings.cliAuthLiveness : {}),
+      grok: record,
+    };
+    saveBridgeSettings(settings);
+    invalidateCliProbeCache();
+    return true;
+  } catch (error: any) {
+    // Authorization truth must never break the provider turn it is observing.
+    // Manual Verify below remains strict and refuses to claim a saved proof.
+    console.warn(`[grok auth] could not persist liveness: ${error?.message || String(error)}`);
+    return false;
+  }
+}
+
+function markGrokAuthVerified(source = 'successful_turn') {
+  return saveGrokAuthLiveness(verifiedCliAuthLiveness(new Date(), source));
+}
+
+function markGrokAuthInvalid(reason = 'credentials_rejected') {
+  return saveGrokAuthLiveness(invalidCliAuthLiveness(new Date(), reason));
+}
+
+function markGrokAuthUnverified(reason = 'verification_required') {
+  return saveGrokAuthLiveness(unverifiedCliAuthLiveness(new Date(), reason));
+}
+
 const obsidianKnowledge = new ObsidianKnowledgeService({
   getSettings: readBridgeSettings,
   saveSettings: saveBridgeSettings,
@@ -869,6 +916,48 @@ const obsidianKnowledge = new ObsidianKnowledgeService({
 
 const DEFAULT_CATEGORY_PERMISSIONS = { browser: true, desktop: true, shell: false };
 const DEFAULT_BRIDGE_SAFETY = { read: true, write: false, execute: false };
+const PROVIDER_CONCURRENCY_DEFAULTS: Record<string, number> = {
+  'cli:claude': 5,
+  'cli:codex': 5,
+  'cli:grok': 5,
+  'cli:gemini': 5,
+  'cli:agy': 5,
+  // Higgsfield historically serialized every generation. Keep that safe
+  // baseline, while allowing the device owner to raise it deliberately.
+  'cli:higgsfield': 1,
+};
+
+function providerConcurrencyDefault(providerKey: string): number {
+  if (providerKey === 'cli:grok' && process.env.EMPIR3_GROK_MAX_CONCURRENT) {
+    return normalizeProviderConcurrencyLimit(process.env.EMPIR3_GROK_MAX_CONCURRENT, 5);
+  }
+  if (providerKey.startsWith('custom:')) return 4;
+  if (providerKey.startsWith('api:')) return 5;
+  return PROVIDER_CONCURRENCY_DEFAULTS[providerKey] || 1;
+}
+
+function normalizedProviderConcurrency(raw: unknown): Record<string, number> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const normalized: Record<string, number> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!/^(?:cli|custom|api):[a-z0-9][a-z0-9_-]{0,63}$/i.test(key)) continue;
+    normalized[key] = normalizeProviderConcurrencyLimit(value, providerConcurrencyDefault(key));
+  }
+  return normalized;
+}
+
+function providerConcurrencyLimit(providerKey: string, settings: any = readBridgeSettings()): number {
+  const configured = normalizedProviderConcurrency(settings?.providerConcurrency)[providerKey];
+  return normalizeProviderConcurrencyLimit(configured, providerConcurrencyDefault(providerKey));
+}
+
+function providerConcurrencySnapshot(providerKey: string): ProviderConcurrencySnapshot {
+  return providerConcurrencyGate.snapshot(providerKey, providerConcurrencyLimit(providerKey));
+}
+
+function customProviderConcurrencyKey(provider: CustomProvider): string {
+  return provider.configSlug ? `api:${provider.configSlug}` : `custom:${provider.slug}`;
+}
 
 function normalizeRwe(raw: any, fallback = DEFAULT_BRIDGE_SAFETY) {
   const source = raw && typeof raw === 'object' ? raw : {};
@@ -956,6 +1045,11 @@ function publicBridgeSettings(settings: any = readBridgeSettings()) {
     lendGitHubCli: !!settings.lendGitHubCli,
     githubScopes: normalizeGhScopes(settings.githubScopes),
     handlers: settings.handlers || {},
+    providerConcurrency: {
+      ...PROVIDER_CONCURRENCY_DEFAULTS,
+      ...normalizedProviderConcurrency(settings.providerConcurrency),
+    },
+    providerConcurrencyMax: MAX_PROVIDER_CONCURRENCY_LIMIT,
     categoryUsage: settings.categoryUsage || {},
     desktopSetup: normalizeDesktopSetupState(settings.desktopSetup),
     desktopFocusKeepOpenDefault: !!settings.desktopFocusKeepOpenDefault,
@@ -1005,6 +1099,11 @@ function saveBridgeSettingsPatch(patch: any = {}) {
   if (typeof patch.lendXaiGrok === 'boolean') next.lendXaiGrok = patch.lendXaiGrok;
   if (typeof patch.lendGoogleAntigravity === 'boolean') next.lendGoogleAntigravity = patch.lendGoogleAntigravity;
   if (typeof patch.lendGitHubCli === 'boolean') next.lendGitHubCli = patch.lendGitHubCli;
+  if (patch.providerConcurrency && typeof patch.providerConcurrency === 'object') {
+    const currentConcurrency = normalizedProviderConcurrency(current.providerConcurrency);
+    const incomingConcurrency = normalizedProviderConcurrency(patch.providerConcurrency);
+    next.providerConcurrency = { ...currentConcurrency, ...incomingConcurrency };
+  }
   // GitHub CLI scope matrix — fine-grained per-capability gates on top of
   // the lendGitHubCli master toggle. normalizeGhScopes fills any unset
   // scope from the safe default baseline.
@@ -1118,7 +1217,12 @@ async function buildSettingsState() {
   (gemini as any).authenticated = geminiAuth.authenticated;
   (gemini as any).auth_via = geminiAuth.via;
   (grok as any).authenticated = grokAuth.authenticated;
+  (grok as any).credentials_present = grokAuth.credentials_present;
   (grok as any).auth_via = grokAuth.via;
+  (grok as any).auth_verification = grokAuth.verification;
+  (grok as any).auth_last_verified_at = grokAuth.last_verified_at;
+  (grok as any).auth_last_check_at = grokAuth.last_check_at;
+  (grok as any).auth_reason = grokAuth.reason;
   (agy as any).authenticated = agyAuth.authenticated;
   (agy as any).auth_via = agyAuth.via;
   // Attach platform-resolved install info so a NOT INSTALLED row can render
@@ -1138,6 +1242,7 @@ async function buildSettingsState() {
       ...resolveCliLifecycle(id, { platform: process.platform, headless: platformProfile.headless }),
       latest: _cliLatestCache?.value?.[id] || null,
     };
+    if (id !== 'github') (p as any).concurrency = providerConcurrencySnapshot(`cli:${id}`);
   }
   const [customProvidersState, apiProvidersState] = await Promise.all([
     buildCustomProvidersState(),
@@ -3383,19 +3488,75 @@ function abortClaudeCliTurn(payload: any, emit: (type: string, payload: any) => 
   return { success: true, id };
 }
 
+function providerConcurrencyBusyResult(providerKey: string, id: string, label: string) {
+  const concurrency = providerConcurrencySnapshot(providerKey);
+  return {
+    success: false,
+    id,
+    stage: 'busy',
+    code: 'provider_concurrency_busy',
+    retryable: true,
+    error: `${label} is at its ${concurrency.max_active}-channel capacity; try the next route`,
+    concurrency,
+  };
+}
+
+async function startCliTurnWithProviderCapacity(
+  providerId: 'claude' | 'codex' | 'gemini' | 'grok' | 'agy',
+  label: string,
+  payload: any,
+  emit: (type: string, payload: any) => void,
+  start: (nextPayload: any, nextEmit: (type: string, payload: any) => void) => Promise<any>,
+) {
+  const id = String(payload?.id || `${providerId}-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const providerKey = `cli:${providerId}`;
+  const lease = providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey));
+  if (!lease) {
+    const result = providerConcurrencyBusyResult(providerKey, id, label);
+    emit(`${providerId}:cli:error`, result);
+    return result;
+  }
+
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    lease.release();
+  };
+  const leaseAwareEmit = (eventType: string, eventPayload: any) => {
+    if (
+      eventPayload?.id === id
+      && (eventType === `${providerId}:cli:done` || eventType === `${providerId}:cli:error`)
+    ) {
+      release();
+    }
+    emit(eventType, eventPayload);
+  };
+
+  try {
+    const result = await start({ ...payload, id }, leaseAwareEmit);
+    if (result?.success === false) release();
+    return result;
+  } catch (error) {
+    release();
+    throw error;
+  }
+}
+
 async function handleClaudeCliCommand(action: string, payload: any, emit: (type: string, payload: any) => void) {
   switch (action) {
     case 'probe': {
       const result = await probeClaudeCli();
-      emit('claude:cli:probe:result', { id: payload?.id || '', ...result });
-      return result;
+      const concurrency = providerConcurrencySnapshot('cli:claude');
+      emit('claude:cli:probe:result', { id: payload?.id || '', ...result, concurrency });
+      return { ...result, concurrency };
     }
     case 'opted_in':
       return { optedIn: claudeDeviceOptedIn() };
     case 'set_opted_in':
       return setClaudeDeviceOptIn(!!payload?.value);
     case 'turn':
-      return startClaudeCliTurn(payload, emit);
+      return startCliTurnWithProviderCapacity('claude', 'Claude Code', payload, emit, startClaudeCliTurn);
     case 'abort':
       return abortClaudeCliTurn(payload, emit);
     case 'tool:result':
@@ -3824,12 +3985,19 @@ async function probeGrokCli() {
     const candidate = join(grokHome, process.platform === 'win32' ? 'grok.exe' : 'grok');
     if (existsSync(candidate)) found = candidate;
   }
+  const auth = grokAuthSignal();
   if (!found) {
     return {
       available: false,
       path: null,
       version: null,
       device_opted_in: grokDeviceOptedIn(),
+      authenticated: false,
+      credentials_present: auth.credentials_present,
+      auth_verification: auth.verification,
+      auth_last_verified_at: auth.last_verified_at,
+      auth_last_check_at: auth.last_check_at,
+      auth_reason: auth.reason,
       ...missingCliModelCatalogFields('grok-models'),
     };
   }
@@ -3852,6 +4020,13 @@ async function probeGrokCli() {
     path: found,
     version,
     device_opted_in: grokDeviceOptedIn(),
+    authenticated: auth.authenticated,
+    credentials_present: auth.credentials_present,
+    auth_via: auth.via,
+    auth_verification: auth.verification,
+    auth_last_verified_at: auth.last_verified_at,
+    auth_last_check_at: auth.last_check_at,
+    auth_reason: auth.reason,
     ...modelCatalogFields(catalog, { source: 'grok-models' }),
   };
 }
@@ -3882,22 +4057,46 @@ function credExpiryPast(ts: unknown): boolean {
   return Number.isFinite(n) && n <= Date.now();
 }
 
-function grokAuthSignal(): { authenticated: boolean; via: 'auth_file' | 'env' | 'none' } {
+function grokAuthSignal(): {
+  authenticated: boolean;
+  credentials_present: boolean;
+  via: 'auth_file' | 'env' | 'none';
+  verification: 'unverified' | 'verified' | 'needs_reauth';
+  last_verified_at: string | null;
+  last_check_at: string | null;
+  reason: string | null;
+} {
   // No documented `grok auth status` subcommand as of 2026-05. ~/.grok/auth.json
   // is keyed by `<oidc_issuer>::<uuid>`; each entry holds a refresh_token plus an
   // access-token `expires_at`. Require a refresh_token in some entry (structural).
   // expires_at is the access expiry (observed already-past on a perfectly usable
   // login — the CLI refreshes) so it is intentionally NOT flagged.
+  const liveness = grokAuthLiveness();
   const creds = readCredsJson(join(homedir(), '.grok', 'auth.json'));
+  let credentialsPresent = false;
+  let via: 'auth_file' | 'env' | 'none' = 'none';
   if (creds && typeof creds === 'object') {
     for (const v of Object.values(creds)) {
       if (v && typeof v === 'object' && ((v as any).refresh_token || (v as any).key)) {
-        return { authenticated: true, via: 'auth_file' };
+        credentialsPresent = true;
+        via = 'auth_file';
+        break;
       }
     }
   }
-  if (process.env.GROK_CODE_XAI_API_KEY || process.env.XAI_API_KEY) return { authenticated: true, via: 'env' };
-  return { authenticated: false, via: 'none' };
+  if (!credentialsPresent && (process.env.GROK_CODE_XAI_API_KEY || process.env.XAI_API_KEY)) {
+    credentialsPresent = true;
+    via = 'env';
+  }
+  return {
+    authenticated: credentialsPresent && liveness.status !== 'needs_reauth',
+    credentials_present: credentialsPresent,
+    via,
+    verification: credentialsPresent ? liveness.status : 'unverified',
+    last_verified_at: liveness.lastVerifiedAt,
+    last_check_at: liveness.lastCheckAt,
+    reason: liveness.reason,
+  };
 }
 
 function geminiAuthSignal(): { authenticated: boolean; via: 'creds_file' | 'env' | 'none' } {
@@ -4132,7 +4331,9 @@ async function cliRun(cmd: any): Promise<any> {
   const background = !!cmd?.background;
   const big = promptText.length > CLI_RUN_BIG_PROMPT_CHARS;
 
-  const id = newCliRunId();
+  const id = typeof cmd?.runId === 'string' && cmd.runId.trim()
+    ? cmd.runId.trim()
+    : newCliRunId();
   mkdirSync(CLI_RUNS_DIR, { recursive: true });
   const tmpPromptFile = join(CLI_RUNS_DIR, `${id}.prompt.txt`);
 
@@ -4204,9 +4405,15 @@ async function cliRun(cmd: any): Promise<any> {
     const text = codex
       ? (codex.text || (codex.eventCount === 0 ? stripCliNoise(r.stdout).trim() : ''))
       : stripCliNoise(r.stdout).trim();
+    const grokAuthFailure = model === 'grok'
+      ? classifyGrokAuthFailure(`${r.stderr}\n${r.stdout}`)
+      : null;
+    if (grokAuthFailure) markGrokAuthInvalid(grokAuthFailure);
+    else if (model === 'grok' && r.exitCode === 0 && !r.timedOut) markGrokAuthVerified('cli_run');
     rec.text = text;
     rec.tail = text.slice(-2000);
-    if (r.timedOut) { rec.status = 'timeout'; rec.error = `timed out after ${r.elapsedMs}ms`; }
+    if (grokAuthFailure) { rec.status = 'error'; rec.error = 'Grok credentials were rejected. Re-authenticate Grok in the Bridge, then verify the session.'; }
+    else if (r.timedOut) { rec.status = 'timeout'; rec.error = `timed out after ${r.elapsedMs}ms`; }
     else if (codex?.failed) { rec.status = 'error'; rec.error = (codex.failure || 'Codex turn failed').slice(0, 2000); }
     else if (codex && codex.eventCount > 0 && !text) { rec.status = 'error'; rec.error = (codex.failure || 'Codex completed without an agent response').slice(0, 2000); }
     else if (r.exitCode !== 0 && !text) { rec.status = 'error'; rec.error = (stripCliNoise(r.stderr).trim() || `exit ${r.exitCode}`).slice(0, 2000); }
@@ -4221,11 +4428,27 @@ async function cliRun(cmd: any): Promise<any> {
     return rec;
   };
 
+  const providerKey = `cli:${model}`;
+  const lease = providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey));
+  if (!lease) {
+    return {
+      ...providerConcurrencyBusyResult(providerKey, id, spec.label),
+      recoverable: true,
+    };
+  }
+  const runWithCapacity = async () => {
+    try {
+      return await runOnce();
+    } finally {
+      lease.release();
+    }
+  };
+
   if (background) {
-    runOnce().catch(e => { const rec = cliRunRegistry.get(id); if (rec) { rec.status = 'error'; rec.error = e?.message || String(e); rec.endedAt = Date.now(); } });
+    runWithCapacity().catch(e => { const rec = cliRunRegistry.get(id); if (rec) { rec.status = 'error'; rec.error = e?.message || String(e); rec.endedAt = Date.now(); } });
     return { success: true, result: { id, model, mode, status: 'running', background: true, message: 'Run started; poll cli_run_status(id) or list with cli_runs.', transcriptDir: CLI_RUNS_DIR } };
   }
-  const rec = await runOnce();
+  const rec = await runWithCapacity();
   return {
     success: rec.status === 'done',
     result: {
@@ -4235,6 +4458,85 @@ async function cliRun(cmd: any): Promise<any> {
       ...(rec.error ? { error: rec.error } : {}),
     },
   };
+}
+
+async function verifyGrokAuthLive(): Promise<{
+  ok: boolean;
+  verified: boolean;
+  error?: string;
+  stage?: string;
+  lastVerifiedAt?: string | null;
+}> {
+  const structural = grokAuthSignal();
+  if (!structural.credentials_present) {
+    markGrokAuthInvalid('credentials_missing');
+    return { ok: false, verified: false, stage: 'auth', error: 'No Grok credentials are present. Authenticate Grok first.' };
+  }
+  const bin = await findGrokBinary();
+  if (!bin) return { ok: false, verified: false, stage: 'spawn', error: 'Grok CLI is not installed.' };
+
+  const id = `grok-auth-verify-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const providerKey = 'cli:grok';
+  const lease = providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey));
+  if (!lease) {
+    return {
+      ok: false,
+      verified: false,
+      stage: 'busy',
+      error: providerConcurrencyBusyResult(providerKey, id, 'Grok Build CLI').error,
+    };
+  }
+
+  let isolation: Awaited<ReturnType<typeof createGrokTurnIsolation>> | null = null;
+  try {
+    isolation = await createGrokTurnIsolation(id);
+    const marker = `EMPIR3_GROK_AUTH_OK_${randomBytes(6).toString('hex')}`;
+    const result = await runCliCapture(normalizeCliShim(bin), [
+      '--single',
+      `Reply with exactly ${marker} and no other text.`,
+      '--output-format', 'plain',
+      '--no-subagents',
+      '--max-turns', '1',
+      '--disable-web-search',
+      ...isolation.extraArgs,
+    ], {
+      cwd: isolation.root,
+      env: { ...process.env, ...isolation.env },
+      timeoutMs: 90_000,
+    });
+    const combined = `${result.stderr}\n${result.stdout}`;
+    const authFailure = classifyGrokAuthFailure(combined);
+    if (authFailure) {
+      markGrokAuthInvalid(authFailure);
+      return {
+        ok: false,
+        verified: false,
+        stage: 'auth',
+        error: 'Grok rejected the saved session. Re-authenticate Grok, then run Verify again.',
+      };
+    }
+    if (result.timedOut) {
+      markGrokAuthUnverified('verification_timeout');
+      return { ok: false, verified: false, stage: 'timeout', error: 'Grok verification timed out. No authorization claim was saved.' };
+    }
+    if (result.exitCode !== 0 || !result.stdout.includes(marker)) {
+      markGrokAuthUnverified('verification_failed');
+      return { ok: false, verified: false, stage: 'verify', error: 'Grok did not complete the verification turn. No authorization claim was saved.' };
+    }
+    if (!markGrokAuthVerified('manual_probe')) {
+      return {
+        ok: false,
+        verified: false,
+        stage: 'persist',
+        error: 'Grok answered successfully, but the Bridge could not save the verification receipt. Try Verify again.',
+      };
+    }
+    const liveness = grokAuthLiveness();
+    return { ok: true, verified: true, lastVerifiedAt: liveness.lastVerifiedAt };
+  } finally {
+    try { await isolation?.cleanup(); } catch {}
+    lease.release();
+  }
 }
 
 function cliRunsList(): any {
@@ -4260,6 +4562,7 @@ async function cliRunRoster(): Promise<any> {
     const available = !!path;
     const lent = !!spec.lend();
     const authenticated = available ? (authByModel[model]?.() ?? false) : false;
+    const authLiveness = model === 'grok' ? grokAuthSignal() : null;
     const install = !available ? cliInstallPublic(model) : null;
     return {
       model,
@@ -4267,6 +4570,13 @@ async function cliRunRoster(): Promise<any> {
       available,
       lent,
       authenticated,
+      ...(authLiveness ? {
+        credentialsPresent: authLiveness.credentials_present,
+        authVerification: authLiveness.verification,
+        authLastVerifiedAt: authLiveness.last_verified_at,
+        authLastCheckAt: authLiveness.last_check_at,
+        authReason: authLiveness.reason,
+      } : {}),
       ready: available && lent && authenticated,
       // null when ready; otherwise the first thing blocking a run.
       blocker: !available ? 'cli_not_installed'
@@ -4535,11 +4845,13 @@ async function launchProviderAuth(provider: string): Promise<{ ok: boolean; laun
   const spec = authLaunchSpec(provider);
   if ('error' in spec) return { ok: false, error: spec.error };
   try {
-    return await launchProviderAction(provider, {
+    const result = await launchProviderAction(provider, {
       bin: spec.bin,
       args: spec.args,
       label: `${provider} sign-in`,
     });
+    if (result.ok && provider === 'grok') markGrokAuthUnverified('sign_in_started');
+    return result;
   } catch (e: any) {
     return { ok: false, error: e?.message || String(e) };
   }
@@ -4791,7 +5103,10 @@ async function launchProviderDeauthorize(provider: string) {
   const action = cliLifecycleAction(provider, 'deauthorize');
   if (!action) return { ok: false, error: `No vendor-supported ${provider} sign-out action is available.` };
   const result = await launchProviderAction(provider, action);
-  if (result.ok) invalidateCliProbeCache();
+  if (result.ok) {
+    invalidateCliProbeCache();
+    if (provider === 'grok') markGrokAuthUnverified('sign_out_started');
+  }
   return result;
 }
 
@@ -4825,7 +5140,6 @@ const CUSTOM_PROVIDER_MAX_RESPONSE_BYTES = 8_000_000;
 const CUSTOM_PROVIDER_MAX_PROBE_BYTES = 2_000_000;
 const CUSTOM_PROVIDER_MAX_MODELS = 250;
 const CUSTOM_PROVIDER_MAX_ENTRIES = 25;
-const CUSTOM_PROVIDER_MAX_ACTIVE_TURNS = 4;
 const PROVIDER_PROBE_CACHE_TTL_MS = 60_000;
 const activeCustomProviderTurns = new Map<string, AbortController>();
 const providerProbeCache = new Map<string, { at: number; result: { available: boolean; authError?: boolean; models?: string[]; error?: string; ms: number } }>();
@@ -5042,6 +5356,7 @@ async function buildApiProvidersState() {
         models: [],
         probeMs: 0,
         error: '',
+        concurrency: providerConcurrencySnapshot(`api:${definition.slug}`),
       };
     }
     const probe = await probeCustomProvider(provider);
@@ -5059,6 +5374,7 @@ async function buildApiProvidersState() {
       models: uniqueChatModels(probe.models || [], definition.defaultModels),
       probeMs: probe.ms,
       error: probe.authError ? 'API key rejected' : (probe.error || ''),
+      concurrency: providerConcurrencySnapshot(`api:${definition.slug}`),
     };
   }));
 }
@@ -5084,6 +5400,7 @@ async function buildCustomProvidersState() {
       models: effectiveModels || [],
       probeMs: probe.ms,
       error: probe.error,
+      concurrency: providerConcurrencySnapshot(`custom:${p.slug}`),
     };
   }));
   return probes;
@@ -5108,6 +5425,7 @@ async function buildLentCustomProvidersState() {
       capabilities: capabilitiesForKind(p.kind),
       available: probe.available && !probe.authError,
       reason: probe.authError ? 'provider rejected its local API key' : (probe.error || ''),
+      concurrency: providerConcurrencySnapshot(customProviderConcurrencyKey(p)),
     };
   }));
 }
@@ -5422,6 +5740,10 @@ async function runLentCustomProviderTurn(payload: any): Promise<{
   contentBlocks?: any[];
   stopReason?: string;
   usage?: any;
+  stage?: string;
+  code?: string;
+  retryable?: boolean;
+  concurrency?: ProviderConcurrencySnapshot;
   error?: string;
 }> {
   const id = String(payload?.id || '').trim();
@@ -5449,8 +5771,11 @@ async function runLentCustomProviderTurn(payload: any): Promise<{
   }
 
   if (activeCustomProviderTurns.has(id)) return { ok: false, error: 'duplicate custom provider turn id' };
-  if (activeCustomProviderTurns.size >= CUSTOM_PROVIDER_MAX_ACTIVE_TURNS) {
-    return { ok: false, error: `this Bridge already has ${CUSTOM_PROVIDER_MAX_ACTIVE_TURNS} custom provider turns in progress` };
+  const providerKey = customProviderConcurrencyKey(provider);
+  const lease = providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey));
+  if (!lease) {
+    const busy = providerConcurrencyBusyResult(providerKey, id, provider.name);
+    return { ok: false, ...busy };
   }
   const controller = new AbortController();
   activeCustomProviderTurns.set(id, controller);
@@ -5469,6 +5794,7 @@ async function runLentCustomProviderTurn(payload: any): Promise<{
   } finally {
     clearTimeout(timer);
     activeCustomProviderTurns.delete(id);
+    lease.release();
   }
 }
 
@@ -5478,6 +5804,13 @@ async function chatWithCustomProvider(opts: { slug: string; model: string; promp
   if (!provider) return { ok: false, error: `Unknown provider: ${opts.slug}` };
   if (!opts.model) return { ok: false, error: '`model` is required' };
   if (!opts.prompt) return { ok: false, error: '`prompt` is required' };
+  const providerKey = customProviderConcurrencyKey(provider);
+  const id = `local-custom-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const lease = providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey));
+  if (!lease) {
+    const busy = providerConcurrencyBusyResult(providerKey, id, provider.name);
+    return { ok: false, error: busy.error, raw: busy };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROVIDER_CHAT_TIMEOUT_MS);
   try {
@@ -5495,6 +5828,7 @@ async function chatWithCustomProvider(opts: { slug: string; model: string; promp
     return { ok: true, text, raw: result.body };
   } finally {
     clearTimeout(timer);
+    lease.release();
   }
 }
 
@@ -5748,15 +6082,16 @@ async function handleCodexCliCommand(action: string, payload: any, emit: (type: 
   switch (action) {
     case 'probe': {
       const result = await probeCodexCli();
-      emit('codex:cli:probe:result', { id: payload?.id || '', ...result });
-      return result;
+      const concurrency = providerConcurrencySnapshot('cli:codex');
+      emit('codex:cli:probe:result', { id: payload?.id || '', ...result, concurrency });
+      return { ...result, concurrency };
     }
     case 'opted_in':
       return { optedIn: codexDeviceOptedIn() };
     case 'set_opted_in':
       return setCodexDeviceOptIn(!!payload?.value);
     case 'turn':
-      return startCodexCliTurn(payload, emit);
+      return startCliTurnWithProviderCapacity('codex', 'OpenAI Codex', payload, emit, startCodexCliTurn);
     case 'abort':
       return abortCodexCliTurn(payload, emit);
     case 'tool:result':
@@ -5859,6 +6194,26 @@ async function runCliSee(
     return { success: false, id, error: `${spec.cliName} CLI not found` };
   }
 
+  const providerKey = `cli:${spec.wirePrefix}`;
+  const lease = providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey));
+  if (!lease) {
+    const busy = providerConcurrencyBusyResult(providerKey, id, `${spec.cliName} CLI`);
+    emit(errType, busy);
+    return busy;
+  }
+  let capacityReleased = false;
+  const releaseCapacity = () => {
+    if (capacityReleased) return;
+    capacityReleased = true;
+    lease.release();
+  };
+  const emitEvent = (eventType: string, eventPayload: any) => {
+    if (eventPayload?.id === id && (eventType === doneType || eventType === errType)) {
+      releaseCapacity();
+    }
+    emit(eventType, eventPayload);
+  };
+
   const fsp = await import('fs/promises');
   const osm = await import('os');
   const tempRoot = spec.tempRoot ? spec.tempRoot() : osm.tmpdir();
@@ -5871,7 +6226,7 @@ async function runCliSee(
     invocation = await spec.buildInvocation({ prompt, system, imageBase64, mimeType, model, tempDir });
   } catch (e: any) {
     try { await fsp.rm(tempDir, { recursive: true, force: true }); } catch {}
-    emit(errType, { id, stage: 'build_invocation', error: e?.message || String(e) });
+    emitEvent(errType, { id, stage: 'build_invocation', error: e?.message || String(e) });
     return { success: false, id, error: e?.message || String(e) };
   }
   const builtAt = Date.now();
@@ -5902,7 +6257,7 @@ async function runCliSee(
     });
   } catch (e: any) {
     try { await fsp.rm(tempDir, { recursive: true, force: true }); } catch {}
-    emit(errType, { id, stage: 'spawn', error: e?.message || String(e) });
+    emitEvent(errType, { id, stage: 'spawn', error: e?.message || String(e) });
     return { success: false, id, error: e?.message || String(e) };
   }
 
@@ -5928,19 +6283,19 @@ async function runCliSee(
     try { await fsp.rm(tempDir, { recursive: true, force: true }); } catch {}
     const duration_ms = Date.now() - startedAt;
     if (timedOut) {
-      emit(errType, { id, stage: 'timeout', exit_code: code ?? -1, duration_ms, error: `${spec.cliName} CLI exceeded ${timeoutSec}s`, stderr_tail: stderrTail.slice(-512) });
+      emitEvent(errType, { id, stage: 'timeout', exit_code: code ?? -1, duration_ms, error: `${spec.cliName} CLI exceeded ${timeoutSec}s`, stderr_tail: stderrTail.slice(-512) });
       return;
     }
     if ((code ?? -1) !== 0) {
-      emit(errType, { id, stage: 'exit', exit_code: code ?? -1, duration_ms, error: `${spec.cliName} CLI exited with code ${code}`, stderr_tail: stderrTail.slice(-512) });
+      emitEvent(errType, { id, stage: 'exit', exit_code: code ?? -1, duration_ms, error: `${spec.cliName} CLI exited with code ${code}`, stderr_tail: stderrTail.slice(-512) });
       return;
     }
     let text = '';
     try { text = invocation.parseText(stdoutBuf); } catch (e: any) {
-      emit(errType, { id, stage: 'parse', exit_code: code ?? -1, duration_ms, error: e?.message || String(e), stderr_tail: stderrTail.slice(-512) });
+      emitEvent(errType, { id, stage: 'parse', exit_code: code ?? -1, duration_ms, error: e?.message || String(e), stderr_tail: stderrTail.slice(-512) });
       return;
     }
-    emit(doneType, {
+    emitEvent(doneType, {
       id,
       text,
       exit_code: code ?? 0,
@@ -5957,7 +6312,7 @@ async function runCliSee(
   });
 
   child.on('error', (e: Error) => {
-    emit(errType, { id, stage: 'spawn', error: e.message });
+    emitEvent(errType, { id, stage: 'spawn', error: e.message });
   });
 
   try {
@@ -5966,7 +6321,7 @@ async function runCliSee(
     }
     child.stdin?.end();
   } catch (e: any) {
-    emit(errType, { id, stage: 'stdin', error: e?.message || String(e) });
+    emitEvent(errType, { id, stage: 'stdin', error: e?.message || String(e) });
     void terminateCliProcessTree(child, { signal: 'SIGTERM', reason: `${spec.wirePrefix} vision stdin failure` });
     return { success: false, id, error: e?.message || String(e) };
   }
@@ -6119,6 +6474,14 @@ async function runAgyCliSee(payload: any, emit: (type: string, payload: any) => 
     return { success: false, id, error: 'prompt required' };
   }
 
+  const providerKey = 'cli:agy';
+  const lease = providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey));
+  if (!lease) {
+    const busy = providerConcurrencyBusyResult(providerKey, id, 'Antigravity CLI');
+    emit('agy:cli:see:error', busy);
+    return busy;
+  }
+
   // Shape the see request as a one-shot agy turn. The image rides as a base64
   // image content block — startPtyCliTurn → materializeTurnImages writes it to a
   // temp file and leads the -p value with an `@<path>` ref (the exact mechanism
@@ -6146,6 +6509,9 @@ async function runAgyCliSee(payload: any, emit: (type: string, payload: any) => 
   // the chunk text and surface it as agy:cli:see:done {text}.
   let acc = '';
   const seeEmit = (type: string, p: any) => {
+    if (p?.id === id && (type === 'agy:cli:done' || type === 'agy:cli:error')) {
+      lease.release();
+    }
     if (type === 'agy:cli:chunk') {
       if (typeof p?.data === 'string') acc += p.data;
       return;
@@ -6167,7 +6533,14 @@ async function runAgyCliSee(payload: any, emit: (type: string, payload: any) => 
     emit(type, p); // pass through anything unexpected
   };
 
-  return startPtyCliTurn(turnPayload, seeEmit, AGY_PTY_CLI_SPEC);
+  try {
+    const result = await startPtyCliTurn(turnPayload, seeEmit, AGY_PTY_CLI_SPEC);
+    if (result?.success === false) lease.release();
+    return result;
+  } catch (error) {
+    lease.release();
+    throw error;
+  }
 }
 
 async function runGeminiCliSee(payload: any, emit: (type: string, payload: any) => void) {
@@ -6493,6 +6866,7 @@ async function startPlainCliTurn(payload: any, emit: (type: string, payload: any
     const startedAt = Date.now();
     let seq = 0;
     let stderrTail = '';
+    let stdoutTail = '';
     let timedOut = false;
 
     // Attach-verification state. Text-only turns verify trivially; CLIs
@@ -6540,6 +6914,7 @@ async function startPlainCliTurn(payload: any, emit: (type: string, payload: any
     child.stdout?.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf-8');
       if (!text) return;
+      stdoutTail = (stdoutTail + text).slice(-8192);
       if (attachVerified) {
         emit(`${spec.wirePrefix}:cli:chunk`, { id, seq: seq++, data: text });
         return;
@@ -6561,6 +6936,27 @@ async function startPlainCliTurn(payload: any, emit: (type: string, payload: any
       if (spec.activeRunMap.get(id) === child) spec.activeRunMap.delete(id);
       if (retryingAttach) return; // successor (or the hard-fail) owns the wire
       const wasAborted = abortedCliTurns.delete(id);
+      const grokAuthFailure = spec.wirePrefix === 'grok'
+        ? classifyGrokAuthFailure(`${stderrTail}\n${stdoutTail}`)
+        : null;
+      if (grokAuthFailure) {
+        markGrokAuthInvalid(grokAuthFailure);
+        if (!attachVerified) held.length = 0;
+        await cleanupAttempt();
+        await cleanupImageTempDir();
+        emit(errType, {
+          id,
+          stage: 'auth',
+          exit_code: code ?? -1,
+          duration_ms: Date.now() - startedAt,
+          error: 'Grok credentials were rejected. Re-authenticate Grok in the Bridge, then verify the session.',
+          auth_reason: grokAuthFailure,
+        });
+        return;
+      }
+      if (spec.wirePrefix === 'grok' && code === 0 && !timedOut && !wasAborted) {
+        markGrokAuthVerified('relay_turn');
+      }
       // Exit is the decisive evidence point for eager plain CLIs — no early
       // init event exists, so a toolless run is detected when the child
       // finishes without the shim ever having served tools/list.
@@ -7034,15 +7430,22 @@ async function handleGeminiCliCommand(action: string, payload: any, emit: (type:
   switch (action) {
     case 'probe': {
       const result = await probeGeminiCli();
-      emit('gemini:cli:probe:result', { id: payload?.id || '', ...result });
-      return result;
+      const concurrency = providerConcurrencySnapshot('cli:gemini');
+      emit('gemini:cli:probe:result', { id: payload?.id || '', ...result, concurrency });
+      return { ...result, concurrency };
     }
     case 'opted_in':
       return { optedIn: geminiDeviceOptedIn() };
     case 'set_opted_in':
       return setGeminiDeviceOptIn(!!payload?.value);
     case 'turn':
-      return startPlainCliTurn(payload, emit, GEMINI_PLAIN_CLI_SPEC);
+      return startCliTurnWithProviderCapacity(
+        'gemini',
+        'Gemini CLI',
+        payload,
+        emit,
+        (nextPayload, nextEmit) => startPlainCliTurn(nextPayload, nextEmit, GEMINI_PLAIN_CLI_SPEC),
+      );
     case 'abort':
       return abortPlainCliTurn(payload, emit, GEMINI_PLAIN_CLI_SPEC);
     case 'tool:result':
@@ -7083,7 +7486,10 @@ async function grokMcpSetup(turnId: string, _bridgeName: string, shimUrl: string
 const GROK_PLAIN_CLI_SPEC: PlainCliTurnSpec = {
   wirePrefix: 'grok',
   cliName: 'grok',
-  baseArgs: [],
+  // Keep the headless transport explicit even though current Grok builds
+  // default to plain. A future vendor default must not turn a relay call into
+  // an interactive TUI or change attach timing.
+  baseArgs: ['--output-format', 'plain'],
   // Grok Build CLI currently exposes only its subscription-backed
   // `grok-build` model. Hosted xAI IDs such as `grok-3` are invalid here,
   // so omit --model and let the CLI use its authenticated default.
@@ -7103,15 +7509,22 @@ async function handleGrokCliCommand(action: string, payload: any, emit: (type: s
   switch (action) {
     case 'probe': {
       const result = await probeGrokCli();
-      emit('grok:cli:probe:result', { id: payload?.id || '', ...result });
-      return result;
+      const concurrency = providerConcurrencySnapshot('cli:grok');
+      emit('grok:cli:probe:result', { id: payload?.id || '', ...result, concurrency });
+      return { ...result, concurrency };
     }
     case 'opted_in':
       return { optedIn: grokDeviceOptedIn() };
     case 'set_opted_in':
       return setGrokDeviceOptIn(!!payload?.value);
     case 'turn':
-      return startPlainCliTurn(payload, emit, GROK_PLAIN_CLI_SPEC);
+      return startCliTurnWithProviderCapacity(
+        'grok',
+        'Grok Build CLI',
+        payload,
+        emit,
+        (nextPayload, nextEmit) => startPlainCliTurn(nextPayload, nextEmit, GROK_PLAIN_CLI_SPEC),
+      );
     case 'run': {
       // One-shot prompt→text via the PROVEN cliRun() invocation (the same
       // recipe the MCP cli_run tool uses: --prompt-file + --output-format plain
@@ -7119,14 +7532,16 @@ async function handleGrokCliCommand(action: string, payload: any, emit: (type: s
       // headless for a no-tools prompt; this delegates to cliRun instead so the
       // server's deep_research live-X leg gets grok's real web+X search back.
       // Verified working end-to-end via cli_run 2026-07-01.
+      const id = String(payload?.id || `grok-research-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
       const result = await cliRun({
         model: 'grok',
         prompt: payload?.prompt,
         mode: payload?.mode === 'agentic' ? 'agentic' : 'text',
         timeoutMs: payload?.timeout_ms,
         cwd: payload?.cwd,
+        runId: id,
       });
-      emit('grok:cli:run:result', { id: payload?.id || '', ...result });
+      emit('grok:cli:run:result', { id, ...result });
       return result;
     }
     case 'abort':
@@ -7219,15 +7634,22 @@ async function handleAgyCliCommand(action: string, payload: any, emit: (type: st
   switch (action) {
     case 'probe': {
       const result = await probeAgyCli();
-      emit('agy:cli:probe:result', { id: payload?.id || '', ...result });
-      return result;
+      const concurrency = providerConcurrencySnapshot('cli:agy');
+      emit('agy:cli:probe:result', { id: payload?.id || '', ...result, concurrency });
+      return { ...result, concurrency };
     }
     case 'opted_in':
       return { optedIn: agyDeviceOptedIn() };
     case 'set_opted_in':
       return setAgyDeviceOptIn(!!payload?.value);
     case 'turn':
-      return startPtyCliTurn(payload, emit, AGY_PTY_CLI_SPEC);
+      return startCliTurnWithProviderCapacity(
+        'agy',
+        'Antigravity CLI',
+        payload,
+        emit,
+        (nextPayload, nextEmit) => startPtyCliTurn(nextPayload, nextEmit, AGY_PTY_CLI_SPEC),
+      );
     case 'abort':
       return abortPtyCliTurn(payload, emit, AGY_PTY_CLI_SPEC);
     case 'tool:result':
@@ -7250,7 +7672,7 @@ async function handleAgyCliCommand(action: string, payload: any, emit: (type: st
 // flush stdout in a non-TTY. Gated by the same execute permission + device
 // opt-in as agy turns.
 async function runAgyCliImageGen(payload: any, emit: (type: string, payload: any) => void) {
-  const id = payload?.id || '';
+  const id = String(payload?.id || `agy-gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   if (!agyDeviceOptedIn()) {
     emit('agy:cli:gen:error', {
       id,
@@ -7267,29 +7689,41 @@ async function runAgyCliImageGen(payload: any, emit: (type: string, payload: any
   const inputImageBase64 = typeof payload?.input_image_base64 === 'string' ? payload.input_image_base64 : undefined;
   const inputImageMime = typeof payload?.input_mime === 'string' ? payload.input_mime : undefined;
 
-  emit('agy:cli:gen:progress', { id, status: 'spawning' });
-
-  const out = await agyGenerateImage({ prompt, timeoutMs, inputImageBase64, inputImageMime });
-  if (out.success && out.result) {
-    try {
-      const delivered = await deliverAsset(out.result.bytes, out.result.mimeType, payload?.upload);
-      emit('agy:cli:gen:done', {
-        id,
-        exit_code: 0,
-        mime_type: out.result.mimeType,
-        ...(delivered.bytesBase64 ? { bytes_base64: delivered.bytesBase64 } : {}),
-        ...(delivered.uploadId ? { upload_id: delivered.uploadId } : {}),
-        tier: delivered.tier,
-        duration_ms: out.result.durationMs,
-      });
-      return { success: true };
-    } catch (e: any) {
-      emit('agy:cli:gen:error', { id, stage: 'upload', error: e?.message || String(e) });
-      return { success: false };
-    }
+  const providerKey = 'cli:agy';
+  const lease = providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey));
+  if (!lease) {
+    const busy = providerConcurrencyBusyResult(providerKey, id, 'Antigravity CLI');
+    emit('agy:cli:gen:error', busy);
+    return busy;
   }
-  emit('agy:cli:gen:error', { id, stage: out.stage || 'error', error: out.error || 'agy imagegen failed' });
-  return { success: false };
+
+  try {
+    emit('agy:cli:gen:progress', { id, status: 'spawning' });
+
+    const out = await agyGenerateImage({ prompt, timeoutMs, inputImageBase64, inputImageMime });
+    if (out.success && out.result) {
+      try {
+        const delivered = await deliverAsset(out.result.bytes, out.result.mimeType, payload?.upload);
+        emit('agy:cli:gen:done', {
+          id,
+          exit_code: 0,
+          mime_type: out.result.mimeType,
+          ...(delivered.bytesBase64 ? { bytes_base64: delivered.bytesBase64 } : {}),
+          ...(delivered.uploadId ? { upload_id: delivered.uploadId } : {}),
+          tier: delivered.tier,
+          duration_ms: out.result.durationMs,
+        });
+        return { success: true };
+      } catch (e: any) {
+        emit('agy:cli:gen:error', { id, stage: 'upload', error: e?.message || String(e) });
+        return { success: false };
+      }
+    }
+    emit('agy:cli:gen:error', { id, stage: out.stage || 'error', error: out.error || 'agy imagegen failed' });
+    return { success: false };
+  } finally {
+    lease.release();
+  }
 }
 
 const activeCapabilityRuns = new Map<string, AbortController>();
@@ -7350,6 +7784,12 @@ async function handleCapabilityCommand(
     return;
   }
 
+  const providerKey = `custom:${configured.slug}`;
+  const lease = providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey));
+  if (!lease) {
+    emit('custom:cap:error', providerConcurrencyBusyResult(providerKey, id, configured.name));
+    return;
+  }
   const controller = new AbortController();
   activeCapabilityRuns.set(id, controller);
   try {
@@ -7377,6 +7817,7 @@ async function handleCapabilityCommand(
     });
   } finally {
     activeCapabilityRuns.delete(id);
+    lease.release();
   }
 }
 
@@ -8850,7 +9291,14 @@ function handleEmpir3Message(msg: any) {
     runLentCustomProviderTurn(payload)
       .then(result => {
         if (result.ok) sendEmpir3('custom:llm:turn:result', { id: payload?.id || '', ...result });
-        else sendEmpir3('custom:llm:turn:error', { id: payload?.id || '', stage: 'provider', error: result.error || 'custom provider call failed' });
+        else sendEmpir3('custom:llm:turn:error', {
+          id: payload?.id || '',
+          stage: result.stage || 'provider',
+          code: result.code,
+          retryable: result.retryable === true,
+          concurrency: result.concurrency,
+          error: result.error || 'custom provider call failed',
+        });
       })
       .catch((e: any) => sendEmpir3('custom:llm:turn:error', {
         id: payload?.id || '', stage: 'bridge', error: e?.message || String(e),
@@ -9005,6 +9453,7 @@ function handleEmpir3Message(msg: any) {
         .then((result: any) => sendEmpir3('higgsfield:cli:probe:result', {
           id: payload?.id || '',
           ...result,
+          concurrency: providerConcurrencySnapshot('cli:higgsfield'),
           // The server's higgsfield row uses requireAuth, which inspects
           // `auth_state` — but probeHiggsfieldCli reports `authenticated`. Map it
           // so an unauthenticated CLI is denied (and an authed one passes).
@@ -9025,9 +9474,25 @@ function handleEmpir3Message(msg: any) {
       });
       return;
     }
-    handleHiggsfieldCliCommand(action, payload, (eventType, eventPayload) => {
-      sendEmpir3(eventType, eventPayload);
-    }).catch((e: any) => {
+    const runHiggsfield = async () => {
+      const id = String(payload?.id || `higgsfield-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+      const providerKey = 'cli:higgsfield';
+      const lease = action === 'gen'
+        ? providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey))
+        : null;
+      if (action === 'gen' && !lease) {
+        sendEmpir3('higgsfield:cli:error', providerConcurrencyBusyResult(providerKey, id, 'Higgsfield CLI'));
+        return;
+      }
+      try {
+        await handleHiggsfieldCliCommand(action, { ...payload, id }, (eventType, eventPayload) => {
+          sendEmpir3(eventType, eventPayload);
+        });
+      } finally {
+        lease?.release();
+      }
+    };
+    runHiggsfield().catch((e: any) => {
       sendEmpir3('higgsfield:cli:error', {
         id: payload?.id || '',
         stage: action || 'unknown',
@@ -15027,6 +15492,13 @@ const httpServer = createServer(async (req, res) => {
         list.push(valid.provider);
       }
       saveCustomProviders(list);
+      if (body?.maxConcurrent !== undefined) {
+        saveBridgeSettingsPatch({
+          providerConcurrency: {
+            [`custom:${valid.provider.slug}`]: normalizeProviderConcurrencyLimit(body.maxConcurrent, 4),
+          },
+        });
+      }
       // Enable only the dispatcher this provider can actually use. Existing
       // settings with no kind remain chat and retain their old behavior.
       const cfg = loadConfig();
@@ -15118,6 +15590,29 @@ const httpServer = createServer(async (req, res) => {
     } catch (e: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
+    }
+    return;
+  }
+
+  // POST /api/cli/verify-auth — an explicit, owner-triggered live liveness
+  // check. Routine settings polling never spends a provider turn. Grok is the
+  // first supported CLI because its auth file can remain present after the
+  // refresh session is no longer usable.
+  if (req.method === 'POST' && url.pathname === '/api/cli/verify-auth') {
+    try {
+      const body = await readRequestBody(req);
+      const provider = String(body?.provider || '').trim().toLowerCase();
+      if (provider !== 'grok') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, verified: false, error: 'Live verification is currently available for Grok.' }));
+        return;
+      }
+      const result = await verifyGrokAuthLive();
+      res.writeHead(result.ok ? 200 : (result.stage === 'busy' ? 409 : 401), { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (e: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, verified: false, error: e?.message || String(e) }));
     }
     return;
   }
@@ -16182,8 +16677,18 @@ async function executeCommand(cmd: BridgeCommand, source = 'direct'): Promise<an
     case 'cli_run_status':
       return cliRunStatus((cmd.params || cmd) as any);
 
-    case 'higgsfield_generate':
-      return higgsfieldGenerate((cmd.params || cmd) as any);
+    case 'higgsfield_generate': {
+      const params = (cmd.params || cmd) as any;
+      const id = String(params?.id || `higgsfield-local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+      const providerKey = 'cli:higgsfield';
+      const lease = providerConcurrencyGate.tryAcquire(providerKey, id, providerConcurrencyLimit(providerKey));
+      if (!lease) return providerConcurrencyBusyResult(providerKey, id, 'Higgsfield CLI');
+      try {
+        return await higgsfieldGenerate({ ...params, id });
+      } finally {
+        lease.release();
+      }
+    }
 
     case 'github_status':
       return githubStatus((cmd.params || {}) as any);
@@ -18666,6 +19171,10 @@ function getWelcomeHtml(apiBase = '') {
                 <label style="display:grid; gap:6px; margin-top:10px; font-size:12px; font-weight:650;">Provider ID
                   <input id="providerModalSlug" type="text" maxlength="48" autocomplete="off" spellcheck="false" placeholder="Created automatically from the name" style="width:100%; padding:9px 10px; font-family:var(--mono); background:var(--surface); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink);">
                 </label>
+                <label style="display:grid; gap:6px; margin-top:10px; font-size:12px; font-weight:650;">Simultaneous model channels
+                  <input id="providerModalConcurrency" type="number" min="1" max="512" step="1" value="4" style="width:110px; padding:9px 10px; font-family:var(--mono); background:var(--surface); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink);">
+                  <span style="font-size:11px; font-weight:400; color:var(--soft);">Start low for local GPU models, then raise it while watching memory and latency.</span>
+                </label>
               </details>
             </div>
             <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
@@ -20488,6 +20997,18 @@ function getWelcomeHtml(apiBase = '') {
   ];
   var CLI_STATE = null; // last full settings-state response
 
+  function capacityControl(providerKey, concurrency, disabled) {
+    var bridge = (CLI_STATE && CLI_STATE.bridge) || {};
+    var max = Number(bridge.providerConcurrencyMax) || 512;
+    var limit = Math.max(1, Number(concurrency && concurrency.max_active) || 1);
+    var active = Math.max(0, Number(concurrency && concurrency.active) || 0);
+    return '<label title="Maximum simultaneous model calls routed through this provider on this Bridge." style="display:flex; align-items:center; gap:6px; margin-top:8px; font-size:11px; color:var(--soft);">' +
+      '<span style="font-weight:650; color:var(--muted);">Channels</span>' +
+      '<input type="number" min="1" max="' + max + '" step="1" value="' + limit + '" data-provider-capacity="' + escapeAttr(providerKey) + '"' + (disabled ? ' disabled' : '') + ' style="width:68px; padding:4px 6px; font-family:var(--mono); text-align:center; background:var(--bg); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink);">' +
+      '<span>' + active + ' active</span>' +
+    '</label>';
+  }
+
   function renderApiProviderRows() {
     var host = $('apiProviderRows');
     if (!host) return;
@@ -20507,6 +21028,7 @@ function getWelcomeHtml(apiBase = '') {
       var modelCount = (p.models || []).length;
       var share = '<label style="display:flex; align-items:center; gap:7px; font-size:11.5px; color:var(--soft); cursor:' + (p.keySet ? 'pointer' : 'default') + ';">' +
         '<input type="checkbox" data-api-share="' + escapeAttr(p.slug) + '"' + (p.lend ? ' checked' : '') + (p.keySet ? '' : ' disabled') + '> Available to my Empir3 agents</label>';
+      var channels = capacityControl('api:' + p.slug, p.concurrency, false);
       var remove = p.keySet ? '<button class="btn small ghost" type="button" data-api-remove="' + escapeAttr(p.slug) + '">Remove</button>' : '';
       return '<div style="border:1px solid var(--surface-2); border-radius:6px; padding:11px 12px; background:var(--surface);">' +
         '<div style="display:flex; gap:10px; align-items:flex-start; justify-content:space-between; margin-bottom:9px;">' +
@@ -20516,7 +21038,7 @@ function getWelcomeHtml(apiBase = '') {
           '<input type="password" data-api-key="' + escapeAttr(p.slug) + '" autocomplete="new-password" spellcheck="false" placeholder="' + escapeAttr(p.keySet ? '•••••• (saved — enter a replacement)' : (p.keyPlaceholder || 'API key')) + '" style="min-width:0; width:100%; padding:8px 10px; font-family:var(--mono); background:var(--bg); border:1px solid var(--surface-2); border-radius:4px; color:var(--ink);">' +
           '<button class="btn small primary" type="button" data-api-save="' + escapeAttr(p.slug) + '">' + (p.keySet ? 'Verify & replace' : 'Verify & save') + '</button>' + remove +
         '</div>' +
-        '<div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:9px;">' + share +
+        '<div style="display:flex; align-items:flex-end; justify-content:space-between; gap:12px; margin-top:9px; flex-wrap:wrap;"><div>' + share + channels + '</div>' +
           (p.error ? '<span style="font-size:11px; color:var(--soft); text-align:right;">' + escapeHtml(p.error) + '</span>' : '') +
         '</div>' +
       '</div>';
@@ -20602,6 +21124,8 @@ function getWelcomeHtml(apiBase = '') {
       var installed = !!p.available;
       if (installed) installedCount++;
       var authed = !!p.authenticated;
+      var credentialsPresent = row.id === 'grok' ? !!p.credentials_present : authed;
+      var authVerification = row.id === 'grok' ? String(p.auth_verification || 'unverified') : '';
       var installTag = installed
         ? '<span class="tag good">' + escapeHtml(p.version || 'installed') + '</span>'
         : '<span class="tag bad">NOT INSTALLED</span>';
@@ -20624,6 +21148,13 @@ function getWelcomeHtml(apiBase = '') {
       var authTag;
       if (!installed) {
         authTag = '<span class="tag" style="color:var(--soft);">—</span>';
+      } else if (row.id === 'grok' && authVerification === 'verified' && authed) {
+        var verifiedWhen = p.auth_last_verified_at ? new Date(p.auth_last_verified_at).toLocaleString() : '';
+        authTag = '<span class="tag good">VERIFIED</span>' + (verifiedWhen ? '<div style="font-size:10.5px; color:var(--soft); margin-top:5px; line-height:1.35;">Last live check ' + escapeHtml(verifiedWhen) + '</div>' : '');
+      } else if (row.id === 'grok' && authVerification === 'needs_reauth') {
+        authTag = '<span class="tag bad">NEEDS RE-AUTH</span>';
+      } else if (row.id === 'grok' && credentialsPresent) {
+        authTag = '<span class="tag warn">CREDENTIALS FOUND · VERIFY</span>';
       } else if (authed) {
         authTag = '<span class="tag good">AUTHED' + (p.auth_via && p.auth_via !== 'creds_file' && p.auth_via !== 'auth_file' ? ' · ' + escapeHtml(String(p.auth_via).toUpperCase()) : '') + '</span>';
       } else if (p.auth_via === 'expired') {
@@ -20654,16 +21185,22 @@ function getWelcomeHtml(apiBase = '') {
       } else {
         toggleCell = '<span style="color:var(--soft);">—</span>';
       }
+      if (row.id !== 'github') {
+        toggleCell += capacityControl('cli:' + row.id, p.concurrency, false);
+      }
       var authBtn = installed
         ? (platform.authLaunchSupported === false
           ? '<span style="font-size:11.5px; color:var(--soft);">Run <code style="user-select:all;">' + escapeHtml(platform.authCommand || row.id) + '</code> in your terminal</span>'
-          : '<button class="btn small" type="button" data-cli-auth="' + row.id + '">' + (authed ? 'Re-auth' : 'Authenticate') + '</button>')
+          : '<button class="btn small" type="button" data-cli-auth="' + row.id + '">' + (credentialsPresent ? 'Re-auth' : 'Authenticate') + '</button>')
         : (p.install
           ? (p.install.launchSupported === false
             ? '<a class="btn small" href="' + escapeAttr(p.install.docsUrl) + '" target="_blank" rel="noopener noreferrer">Instructions</a>'
             : '<button class="btn small" type="button" data-cli-install="' + row.id + '">Install</button>')
           : '<span style="font-size:11.5px; color:var(--soft);">install first</span>');
       var updateBtn = '';
+      var verifyBtn = row.id === 'grok' && installed && credentialsPresent
+        ? '<button class="btn small ghost" type="button" data-cli-verify-auth="grok" title="Run a small live Grok turn and prove this saved session works">Verify</button>'
+        : '';
       if (installed && lifecycle.update) {
         if (lifecycle.update.launchSupported === false) {
           updateBtn = lifecycle.update.command
@@ -20679,7 +21216,7 @@ function getWelcomeHtml(apiBase = '') {
           ? '<span style="font-size:10.5px; color:var(--soft);">Sign out: <code style="user-select:all;">' + escapeHtml(lifecycle.deauthorize.command || '') + '</code></span>'
           : '<button class="btn small ghost" type="button" data-cli-deauthorize="' + row.id + '" data-cli-deauthorize-label="' + escapeAttr(lifecycle.deauthorize.label || 'Sign out') + '" title="' + escapeAttr(lifecycle.deauthorize.label || ('Sign out of ' + row.label)) + '" aria-label="' + escapeAttr(lifecycle.deauthorize.label || ('Sign out of ' + row.label)) + '">Sign out</button>';
       }
-      var actionCell = '<div class="cli-actions">' + authBtn + updateBtn + deauthBtn + '</div>';
+      var actionCell = '<div class="cli-actions">' + authBtn + verifyBtn + updateBtn + deauthBtn + '</div>';
       html += '<tr>' +
         '<td class="col-nm"><div style="font-weight:600;">' + escapeHtml(row.label) + '</div><div style="font-size:11.5px; color:var(--soft);">' + escapeHtml(row.vendor) + (platform.label ? ' · ' + escapeHtml(platform.label) : '') + (p.path ? ' · ' + escapeHtml(shortPath(p.path)) : '') + '</div></td>' +
         '<td>' + installTag + '</td>' +
@@ -20746,7 +21283,7 @@ function getWelcomeHtml(apiBase = '') {
       var shareLabel = cp.lend
         ? (avail ? 'shared with Empir3' : 'shared · offline')
         : (avail ? 'private to this PC' : 'private · offline');
-      var lendCell = '<label class="sw"><input type="checkbox" data-custom-lend="' + escapeAttr(cp.slug) + '"' + (cp.lend?' checked':'') + '><span class="s"></span></label> <span style="font-size:11.5px; color:var(--soft); margin-left:6px;">' + shareLabel + '</span>';
+      var lendCell = '<label class="sw"><input type="checkbox" data-custom-lend="' + escapeAttr(cp.slug) + '"' + (cp.lend?' checked':'') + '><span class="s"></span></label> <span style="font-size:11.5px; color:var(--soft); margin-left:6px;">' + shareLabel + '</span>' + capacityControl('custom:' + cp.slug, cp.concurrency, false);
       var kind = cp.kind || 'chat';
       var kindLabel = kind === 'stt' ? 'EARS' : kind === 'tts' ? 'MOUTH' : kind === 'image' ? 'IMAGINATION' : 'BRAIN';
       html += '<tr>' +
@@ -20769,6 +21306,9 @@ function getWelcomeHtml(apiBase = '') {
     });
     document.querySelectorAll('[data-cli-auth]').forEach(function(btn){
       btn.addEventListener('click', function(){ onCliAuthClick(btn.dataset.cliAuth); });
+    });
+    document.querySelectorAll('[data-cli-verify-auth]').forEach(function(btn){
+      btn.addEventListener('click', function(){ onCliVerifyAuthClick(btn.dataset.cliVerifyAuth); });
     });
     document.querySelectorAll('[data-cli-install]').forEach(function(btn){
       btn.addEventListener('click', function(){ onCliInstallClick(btn.dataset.cliInstall); });
@@ -20811,6 +21351,30 @@ function getWelcomeHtml(apiBase = '') {
         toggleCustomProviderLend(cb.dataset.customLend, cb.checked);
       });
     });
+    document.querySelectorAll('[data-provider-capacity]').forEach(function(input){
+      input.addEventListener('change', function(){ saveProviderCapacity(input); });
+    });
+  }
+
+  async function saveProviderCapacity(input) {
+    var key = input.dataset.providerCapacity;
+    var statusId = key.indexOf('api:') === 0 ? 'apiKeysStatus' : 'cliStatus';
+    var max = Number((CLI_STATE && CLI_STATE.bridge && CLI_STATE.bridge.providerConcurrencyMax) || 512);
+    var limit = Math.max(1, Math.min(max, Math.floor(Number(input.value) || 1)));
+    input.value = String(limit);
+    input.disabled = true;
+    setStatus(statusId, 'Saving ' + key + ' channel limit…', 'info');
+    markLocalMutate();
+    try {
+      var values = {}; values[key] = limit;
+      await postJson('/api/settings/state', { bridge: { providerConcurrency: values } });
+      setStatus(statusId, key + ' can now run up to ' + limit + ' simultaneous model call' + (limit === 1 ? '' : 's') + '.', 'ok');
+      await loadCliState();
+    } catch (e) {
+      setStatus(statusId, 'Channel limit was not saved: ' + e.message, 'err');
+      input.disabled = false;
+      await loadCliState();
+    }
   }
 
   async function removeCustomProvider(slug) {
@@ -20902,6 +21466,19 @@ function getWelcomeHtml(apiBase = '') {
     } catch (e) {
       setStatus('cliStatus', 'Auth call failed: ' + e.message, 'err');
     }
+  }
+
+  async function onCliVerifyAuthClick(id) {
+    setStatus('cliStatus', 'Running a small live Grok authorization check…', 'info');
+    try {
+      var j = await postJson('/api/cli/verify-auth', { provider: id });
+      if (!j || !j.verified) throw new Error((j && j.error) || 'verification failed');
+      var checkedAt = j.lastVerifiedAt ? new Date(j.lastVerifiedAt).toLocaleString() : 'just now';
+      setStatus('cliStatus', 'Grok session verified live ' + checkedAt + '.', 'ok');
+    } catch (e) {
+      setStatus('cliStatus', 'Grok verification failed: ' + e.message, 'err');
+    }
+    await loadCliState();
   }
 
   async function onCliInstallClick(id) {
@@ -21037,6 +21614,7 @@ function getWelcomeHtml(apiBase = '') {
     $('providerModalModels').value = '';
     $('providerModalSlug').value = 'ollama-local';
     $('providerModalLend').checked = true;
+    $('providerModalConcurrency').value = '4';
   });
   var kokoroExampleBtn = $('providerModalKokoroExample');
   if (kokoroExampleBtn) kokoroExampleBtn.addEventListener('click', function(){
@@ -21050,6 +21628,7 @@ function getWelcomeHtml(apiBase = '') {
     $('providerModalModels').value = 'af_heart';
     $('providerModalSlug').value = 'kokoro-local';
     $('providerModalLend').checked = true;
+    $('providerModalConcurrency').value = '2';
   });
   var comfyExampleBtn = $('providerModalComfyExample');
   if (comfyExampleBtn) comfyExampleBtn.addEventListener('click', function(){
@@ -21063,6 +21642,7 @@ function getWelcomeHtml(apiBase = '') {
     $('providerModalModels').value = 'sd_xl_base_1.0.safetensors';
     $('providerModalSlug').value = 'comfyui-local';
     $('providerModalLend').checked = true;
+    $('providerModalConcurrency').value = '1';
     $('providerModalWorkflow').value = JSON.stringify({
       '3': { class_type:'KSampler', inputs:{ seed:'%SEED%', steps:25, cfg:7, sampler_name:'euler', scheduler:'normal', denoise:1, model:['4',0], positive:['6',0], negative:['7',0], latent_image:['5',0] } },
       '4': { class_type:'CheckpointLoaderSimple', inputs:{ ckpt_name:'%MODEL%' } },
@@ -21092,6 +21672,7 @@ function getWelcomeHtml(apiBase = '') {
       apiKey: ($('providerModalKey').value || '').trim(),
       models: models,
       lend: !!$('providerModalLend').checked,
+      maxConcurrent: Math.max(1, Math.min(512, Math.floor(Number($('providerModalConcurrency').value) || 4))),
       kind: kind,
       wire: wire,
       workflowJson: wire === 'comfyui' ? ($('providerModalWorkflow').value || '').trim() : ''

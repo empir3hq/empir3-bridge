@@ -9,9 +9,17 @@ test('CLI lifecycle endpoints accept provider ids but never request-supplied com
   assert.match(server, /url\.pathname === '\/api\/cli\/check-updates'/);
   assert.match(server, /url\.pathname === '\/api\/cli\/update'/);
   assert.match(server, /url\.pathname === '\/api\/cli\/deauthorize'/);
+  assert.match(server, /url\.pathname === '\/api\/cli\/verify-auth'/);
   assert.match(server, /cliLifecycleAction\(provider, 'update'\)/);
   assert.match(server, /cliLifecycleAction\(provider, 'deauthorize'\)/);
   assert.doesNotMatch(server, /launchProvider(?:Update|Deauthorize)\([^)]*body\?\.(?:command|args)/);
+});
+
+test('Grok live auth verification is explicit and never runs during settings polling', () => {
+  assert.match(server, /async function verifyGrokAuthLive/);
+  assert.match(server, /data-cli-verify-auth="grok"/);
+  assert.match(server, /postJson\('\/api\/cli\/verify-auth', \{ provider: id \}\)/);
+  assert.match(server, /CREDENTIALS FOUND · VERIFY/);
 });
 
 test('Windows auth and lifecycle actions use a persistent visible terminal', () => {

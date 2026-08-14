@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.83] - 2026-08-14
+
+### Added
+
+- Every Bridge inference provider now has its own Bridge-owned concurrency
+  pool: Claude, Codex, Grok, Gemini, Antigravity, Higgsfield, local/custom
+  endpoints, and key-backed API providers. The API & CLIs pane exposes live
+  per-provider channel controls from 1–512; changes persist immediately and do
+  not require a Bridge restart or release. Pools are shared by every user,
+  project, agent, sub-agent, research, vision, and media call that reaches that
+  physical provider while remaining independent from other providers.
+- Provider probes and advertisements include isolated-session support, current
+  active work, and the configured maximum so compatible app servers can admit
+  parallel work without reviving cross-session leakage.
+- A repeatable `npm run stress:grok` check launches isolated Grok processes
+  with unique markers and fails if any session sees another session's output.
+- Grok authorization now has an explicit live Verify action. The API & CLIs
+  pane distinguishes credentials found from a recently provider-verified
+  session, records verification freshness, and changes to Needs re-auth when
+  a real turn proves the saved session was rejected.
+
+### Fixed
+
+- Capacity exhaustion returns a typed, retryable
+  `provider_concurrency_busy` response immediately. Normal configured provider
+  failover or a partial Deep Research result can proceed instead of waiting
+  for a timeout or replaying work.
+- Grok sign-in failures are classified before MCP attachment retries, so a
+  stale credential file no longer produces a misleading `mcp_attach` error or
+  triggers two doomed CLI attempts. Credit, subscription, and rate-limit
+  failures remain separate because reauthentication cannot repair them.
+
+## [0.3.82] - 2026-08-11
+
+### Security
+
+- The Windows payload tray is now Authenticode-signed with the same production
+  Azure Trusted Signing identity as the bootstrap and desktop package.
+  This closes a release-path gap where Microsoft Defender could quarantine the
+  unsigned PyInstaller tray during payload extraction, leaving the updated
+  daemon running without its tray icon.
+
+### Fixed
+
+- Carries forward the Higgsfield 1.1.x `job_type` catalog compatibility from
+  0.3.81 in a payload whose signed tray survives extraction and relaunch.
+
+## [0.3.81] - 2026-08-11
+
+### Fixed
+
+- Higgsfield CLI 1.1.x model discovery now accepts the vendor's current
+  `job_type` identifier while retaining compatibility with the earlier
+  `job_set_type` response. The Bridge again returns a non-empty live catalog
+  instead of hiding current Nano Banana and other media models.
+
 ## [0.3.80] - 2026-08-11
 
 ### Security

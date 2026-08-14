@@ -1,6 +1,6 @@
 {
   "name": "empir3-bridge-headless-package",
-  "version": "0.3.80",
+  "version": "0.3.83",
   "private": true,
   "description": "Lightweight systemd package for the shared Empir3 Bridge engine on Linux servers.",
   "scripts": {

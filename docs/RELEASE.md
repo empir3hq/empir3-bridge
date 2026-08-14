@@ -57,6 +57,12 @@ Build the legacy Windows bootstrap payload when runtime behavior changes:
 npm run build:windows
 ```
 
+On the maintained Windows signing host, verify both
+`build/dist/Empir3Tray.exe` and `build/payload-staging/Empir3Tray.exe` have a
+valid production-publisher Authenticode signature, then run a Microsoft Defender
+custom scan over both files and the final payload archive. Any new detection is
+a release blocker; do not add an antivirus exclusion or publish around it.
+
 Build native desktop artifacts on their native CI/host operating system:
 
 ```bash
@@ -135,8 +141,11 @@ Production release is fail-closed:
 
 - Run `npm run release:signing-preflight` on each native signing host first.
 - Windows Electron/Squirrel artifacts use Azure Trusted Signing when
-  `EMPIR3_SIGN_WINDOWS=1`; the legacy Go bootstrap additionally uses
-  `EMPIR3_REQUIRE_SIGNED=1`.
+  `EMPIR3_SIGN_WINDOWS=1`; the legacy Go bootstrap and the nested PyInstaller
+  tray additionally use `EMPIR3_REQUIRE_SIGNED=1`. Never publish a Windows
+  payload whose internal `Empir3Tray.exe` is unsigned: Defender can quarantine
+  that nested executable during extraction even though the outer tarball has a
+  valid release signature, leaving a current daemon with no tray icon.
 - macOS packages must be Developer ID-signed, submitted to Apple notarization,
   accepted, and stapled. Set `EMPIR3_SIGN_MACOS=1`,
   `EMPIR3_MAC_SIGN_IDENTITY`, and exactly one supported notary credential
