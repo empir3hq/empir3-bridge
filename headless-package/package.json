@@ -1,0 +1,11 @@
+{
+  "name": "empir3-bridge-headless-package",
+  "version": "0.3.95",
+  "private": true,
+  "description": "Lightweight systemd package for the shared Empir3 Bridge engine on Linux servers.",
+  "scripts": {
+    "make": "node scripts/build-package.cjs",
+    "smoke": "node scripts/smoke-package.cjs",
+    "verify": "node --check scripts/build-package.cjs && node --check scripts/smoke-package.cjs && node --check assets/headless-update.cjs && node --test test/*.test.cjs"
+  }
+}

@@ -1,0 +1,132 @@
+{
+  "name": "@empir3hq/empir3-bridge",
+  "version": "0.3.95",
+  "description": "Local-first browser and desktop control bridge for AI agents using MCP.",
+  "license": "MIT",
+  "author": "Empir3",
+  "homepage": "https://github.com/empir3hq/empir3-bridge",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/empir3hq/empir3-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/empir3hq/empir3-bridge/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "browser",
+    "desktop-automation",
+    "automation",
+    "chrome",
+    "cdp",
+    "computer-use",
+    "mcp-server",
+    "ai-tools",
+    "local-first"
+  ],
+  "bin": {
+    "empir3-bridge": "src/launch.js",
+    "empir3-bridge-mcp": "src/mcp-entry.js"
+  },
+  "main": "./src/cli.ts",
+  "scripts": {
+    "agents:sync": "node scripts/sync-agent-docs.mjs",
+    "agents:check": "node scripts/sync-agent-docs.mjs --check",
+    "start": "node src/launch.js",
+    "kill": "node src/launch.js --kill",
+    "status": "node src/launch.js --status",
+    "cli": "tsx src/cli.ts",
+    "mcp": "tsx src/mcp-server.ts",
+    "build:mcp": "esbuild src/mcp-server.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/mcp-server.cjs --external:@modelcontextprotocol/sdk --external:zod",
+    "release:check": "node build/build.js --check",
+    "release:signing-preflight": "node scripts/release-signing-preflight.mjs",
+    "build:windows": "node build/build.js",
+    "build:release": "node build/build.js",
+    "release:promote-desktop": "node scripts/promote-desktop-channel.mjs",
+    "test:bootstrap": "node scripts/bootstrap-e2e.mjs",
+    "test:bootstrap-go": "cd build/bootstrap-go && go test ./...",
+    "publish:downloads": "node scripts/publish-downloads.mjs",
+    "certify:bridge": "node scripts/certify-bridge.mjs",
+    "smoke:companion": "node scripts/check-companion-surface.mjs",
+    "smoke:headless": "node scripts/smoke-headless.mjs",
+    "smoke:live": "node scripts/smoke-live-bridge.mjs",
+    "stress:grok": "node scripts/stress-grok-concurrency.mjs",
+    "stress:grok-boundary": "node scripts/stress-grok-refresh-boundary.mjs",
+    "smoke:calibration": "node scripts/smoke-calibration-workflow.mjs",
+    "smoke:browser-actions": "node scripts/verify-browser-actions.mjs",
+    "desktop:install": "npm --prefix desktop-shell install",
+    "desktop:dev": "npm --prefix desktop-shell start",
+    "desktop:smoke": "npm --prefix desktop-shell run smoke",
+    "desktop:test": "npm --prefix desktop-shell run verify",
+    "desktop:stage": "npm --prefix desktop-shell run stage",
+    "desktop:package": "npm --prefix desktop-shell run package",
+    "desktop:make": "npm --prefix desktop-shell run make",
+    "desktop:artifacts": "npm --prefix desktop-shell run artifacts",
+    "desktop:verify-signatures": "npm --prefix desktop-shell run verify:signatures",
+    "desktop:artifacts:index": "npm --prefix desktop-shell run artifacts:index --",
+    "desktop:package-smoke": "npm --prefix desktop-shell run smoke:package",
+    "desktop:mcp-smoke": "npm --prefix desktop-shell run smoke:mcp-package",
+    "desktop:installer-smoke:windows": "npm --prefix desktop-shell run smoke:installer:windows",
+    "desktop:installer-smoke:linux": "npm --prefix desktop-shell run smoke:installer:linux",
+    "desktop:update-smoke:linux": "npm --prefix desktop-shell run smoke:update:linux",
+    "desktop:update-smoke:macos": "npm --prefix desktop-shell run smoke:update:macos",
+    "desktop:installer-smoke:macos": "npm --prefix desktop-shell run smoke:installer:macos",
+    "desktop:accept-live": "npm --prefix desktop-shell run accept:live",
+    "desktop:verify-package": "npm --prefix desktop-shell run verify:package",
+    "headless:make": "node headless-package/scripts/build-package.cjs",
+    "headless:smoke": "node headless-package/scripts/smoke-package.cjs",
+    "headless:verify": "npm --prefix headless-package run verify",
+    "scale": "node scripts/scale.js",
+    "test": "node scripts/run-tests.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "node-pty": "^1.1.0",
+    "tsx": "^4.20.0",
+    "ws": "^8.21.0",
+    "zod": "^3.25.76"
+  },
+  "overrides": {
+    "@hono/node-server": "^2.0.5",
+    "express-rate-limit": "^8.5.2",
+    "fast-uri": "^3.1.5",
+    "hono": "^4.12.34",
+    "ip-address": "^10.2.0",
+    "qs": "^6.15.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "src/",
+    "assets/",
+    "build/bootstrap.js",
+    "build/build.js",
+    "build/payload-entry.js",
+    "build/payload-signing-pub.json",
+    "installer/",
+    "tray/",
+    "scripts/",
+    "docs/AGENT_GUIDE.md",
+    "docs/RELEASE.md",
+    "docs/SAFETY.md",
+    "docs/TESTING.md",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md"
+  ]
+}
