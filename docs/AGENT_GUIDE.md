@@ -1,0 +1,303 @@
+# Bridge operating guide
+
+## Start here: one target, one verified result
+
+Core and advanced are instruction sections, not model tiers. Every model,
+including premium Astra and local models, can discover and use the complete
+installed tool set. Device support and the user's permissions determine access.
+
+1. Call `bridge_control_catalog` for live tool flags and supported actions.
+2. Copy a browser `targetId` from `browser_tab_state`, or a native window handle
+   from `desktop_snapshot(scope:"all-windows")` / the window list. Call
+   `bridge_control_activate` with that exact target when focus is needed.
+   For independent browser work, `browser_tab_open` returns a new exact target;
+   finish with `browser_tab_close` for that target when its work is complete.
+3. Call `bridge_control_observe` with the explicit target below. Native windows
+   return accessible controls and a focused JPEG; use `image:false` for text only.
+4. Call `bridge_control_run` with one step and its expected result. Read the
+   receipt. Continue only after the result you need has been verified.
+
+```json
+{"target":{"surface":"browser","tabId":"COPY_RETURNED_ID"},"steps":[{"action":"fill","locator":{"role":"textbox","name":"Name"},"value":"Vincent","expect":{"kind":"value","locator":{"role":"textbox","name":"Name"},"equals":"Vincent"}}]}
+```
+
+Native targets use `{"surface":"desktop","windowHandle":123}`; replace 123
+with the observed numeric handle. Use a fresh `locator.ref`, or an exact
+`automationId`/`runtimeId` from observation. Names can change as text is entered.
+When a field's name changes, use its observed stable identity for verification.
+
+For Notepad and similar editors, use the observed `Document` control with
+`fill` and a `value` expectation. Document values use LF (`\n`) line endings,
+including when Windows exposes CR or CRLF paragraphs. Verify the new editor is
+blank before entering text; opening the application may restore an old tab.
+Use `keys:["CTRL","T"]` for a shortcut, not `key:"CTRL+T"`.
+
+A single left click may report `method:"uia-invoke"` when a Windows provider
+hit-tests to the button's containing pane. The Bridge verifies the exact button
+and its hosting pane before invoking it. Other clicks retain native mouse input.
+If a fresh target still fails its guard, stop and report it; do not switch to
+coordinates to bypass that refusal.
+
+For insertion at the existing caret, `desktop_type` / `gui:type` preserves the
+current selection. Modern Notepad uses its synchronous editor insertion API and
+reports `method:"editor-replace-selection"`; other controls retain Unicode
+keyboard input. Read the editor value afterward. A dispatched receipt alone
+does not verify the final text.
+
+For a Windows file picker, observe its exact window after it opens. Focus the
+filename field, observe again, then use `fill` on the observed `Edit` control
+with a `value` expectation for the complete path. Press Enter only after that
+value is verified. Windows autocomplete can replace the focused edit while raw
+typing is in progress. If input stops with `focused control changed`, inspect
+the partial value and refill the complete path; do not append or blindly replay.
+
+In Empir3, call `desktop_control` with `type:"gui", action:"observe"|"activate"|"run"`
+and put the same arguments in `params`. Browser equivalents are
+`browser_control` actions `control_observe` / `control_activate` / `control_run`.
+`tab_open` and `tab_close` provide exact tab lifecycle control. Preserve the chosen
+`device_name` or `device_id`. `tab_state` and `tab_focus` select the browser tab.
+Use `desktop_control` help:list category="core" for the short list, or
+category="advanced" for the complete additional actions.
+
+| Action | Arguments | What is verified |
+|---|---|---|
+| fill | locator, string value (empty string clears) | Exact field value; browser uses trusted input, Windows uses ValuePattern or Unicode input |
+| select | Browser: locator + option value; Windows: locator of selectable item | Selected option/item |
+| check | locator, boolean value | Checkbox state |
+| expand | locator, boolean value | Expanded/collapsed state |
+| click | locator | Add expect to verify the application outcome |
+| press | key or keys | Add expect for the shortcut's effect |
+| scroll | Browser: x/y CSS pixels; Windows: clicks wheel notches, positive up, optional x/y point | Add expect for the new state |
+| drag | Windows: x/y, toX/toY physical screen pixels | Add expect for the destination state |
+| navigate | Browser http(s) URL | Add expect kind:url or a page control |
+| wait | expect | Wait for a real state without repeating input |
+
+Conditions support `exists`, `absent`, `value`, `text`, `checked`, `expanded`
+and browser `url`, with `equals` or text `contains`. Both `expect` and `when`
+reuse the step's locator when their own locator is omitted. Supply a condition
+locator to check a different control, or for a standalone `wait` with no step
+locator. URL conditions need no locator. Malformed conditions reject the whole
+batch before input. Browser observations expose `checked` (true, false or
+"mixed"), `expanded` and `disabled`; checkbox `value: "on"` is not its checked
+state. Older Windows checkboxes use native-handle MSAA
+readback when UIA lacks TogglePattern. If neither provider exposes a state,
+the result reports it unavailable; do not assume an action succeeded.
+
+The green arrow follows actual native input with short acceleration and settling.
+Held-button drags follow a straight path. A green perimeter labelled "Observed
+by agent" identifies the captured region for six seconds after an observation;
+it does not mean a continuous camera feed. Pause hides the perimeter immediately.
+Windows reduced-motion preferences are respected; deployment environments may
+also set `EMPIR3_CONTROL_REDUCED_MOTION=1` to disable travel animation and pulses.
+
+## Advanced workflows and recovery
+
+`steps` accepts 1–32 actions against one target. `when` conditionally skips a
+step. `expect` polls state, normally for 5 seconds, capped at 15 seconds per
+step and 60 seconds per plan. This avoids repeated model round trips for known
+short procedures. Permissions are checked for each input operation; batches do
+not grant new access. An active operation owns the shared Bridge until it ends.
+Use separate Bridge instances (`bridge_scale`) for independent parallel work.
+
+| Receipt / error | Next action |
+|---|---|
+| verified:true | The reported state was observed; continue |
+| dispatched:true, verified:false | Observe the actual application result |
+| inputMayHaveOccurred:true | Inspect before retrying; part of the action may have run |
+| stale_observation / target_changed / target_missing | Observe the intended target again |
+| ambiguous_target | Refine the locator until exactly one control matches |
+| target_not_current / target_owned_by_user | Select the intended tab, or wait for the user's hand-back |
+| activation_refused | Ask the user to click the selected window once; observe again. Do not loop activation |
+| control_busy | Wait for idle or use an isolated Bridge instance |
+| control_paused | User resumes in the local Bridge console; take a fresh observation |
+| unsupported_control | Use the existing ref, coordinate, vision or scripting tools, then verify |
+| permission denied / disabled locally | Explain the needed permission; the user controls it |
+
+Failed workflows and v2 playback return structured receipts with `isError:true`
+in MCP. Read the successful receipts before the failing step. Observe current
+state before retrying; never replay a whole sequence to repair one failed step.
+
+Existing input primitives also accept an optional explicit `target` through MCP
+and local commands. Native input checks the selected foreground window at the
+input boundary. A workflow stops at its first failure; it never repeats input
+to satisfy an expectation. Bounds and refs must come from fresh observation.
+
+Focused Windows capture uses PrintWindow with explicit origin and scale, so it
+can capture an occluded window. Map image coordinates as `origin + pixel * scale`.
+Some GPU/protected apps return blank content, and minimized windows are refused.
+Restore the window and use the existing visible-region screenshot when needed.
+This is not a Windows Graphics Capture implementation.
+
+The existing advanced tools remain available: JavaScript evaluation, browser
+checklists, touch/device emulation, coordinates, native drag, vision targeting,
+shell/clipboard/file tools, recording, isolated instances and diagnostics.
+Discover exact arguments with the catalog or the corresponding tool schema.
+
+## User feedback, recording and problem reports
+
+The large visible cursor and click pulse accompany native/browser input. The
+local `/welcome` console shows the current owner, action and waiting state.
+Pause control stops subsequent input and interrupts guarded native input;
+Resume preserves permissions. Holding Escape cancels guarded native movement.
+Pause does not undo an action already delivered or cancel unrelated shell jobs.
+
+`browser_record_start` captures trusted main-page DOM events in an isolated CDP
+world. `browser_record_stop` saves the procedure; `browser_recordings` lists it;
+`browser_play` replays it with a two-minute deadline and stops on failure.
+Passwords become `{{PASSWORD}}` variables. Other entered text is saved locally:
+review the file and parameterize private values before sharing or replaying.
+Main-page selectors survive navigation, but DOM changes may require repair.
+Cross-origin frames, closed shadow roots and canvas-only actions need advanced
+tools. The recorder does not expose Bridge credentials to page scripts.
+App playback reserves a per-turn action budget before sending the procedure.
+
+Use **Report a problem** in the console to preview and download compact local
+diagnostics. Image inclusion is off by default. Entered text, scripts, embedded
+image blobs and URL paths are omitted from action history. Names, errors and
+other metadata may still be private: review before sharing. Nothing is sent
+automatically. `bridge_control_diagnostics` returns the image-free report.
+
+Use the tools actually advertised by the selected device. Start with this loop:
+
+1. Look at the intended window or page.
+2. Find the control by name and copy its exact returned ref.
+3. Perform one action.
+4. Check the resulting value, page, selection or message.
+
+A receipt saying `dispatched` means input was sent. It does not prove the app
+accepted it. Refresh after scrolling, moving a window, opening a menu, changing
+a dialog or navigating. Desktop refs expire after 30 seconds or a new snapshot.
+A `stale_observation` response means look again before acting.
+
+## Choose the surface
+
+| Target | Observe | Act |
+| --- | --- | --- |
+| Bridge browser | `browser_snapshot` | `browser_click_ref`, `browser_type_ref`, `browser_press`, `browser_scroll` |
+| Native Windows app | `desktop_snapshot` | `desktop_click_ref`, `desktop_type`, `desktop_key`, `desktop_scroll`, `desktop_drag` |
+| Pixels without accessible controls | `desktop_screenshot` | Use an observed physical point; a text-only model needs a configured vision locator or a user-selected point |
+
+For another native window, list windows and select the exact intended window
+first. Keep the user-selected device throughout the task. On Empir3, copy the
+exact computer name into `device_name` whenever the user names one.
+
+## MCP examples
+
+Replace the sample ref with an exact ref from the current snapshot.
+
+```text
+desktop_snapshot
+desktop_click_ref ref:<field ref>
+desktop_type text:"Vincent - cafe" ref:<field ref>
+desktop_snapshot
+```
+
+The final snapshot includes readable field values where the accessibility
+provider or standard Windows edit control supports them. Password fields are
+excluded. Confirm the text you intended actually arrived.
+
+```text
+desktop_key keys:["CTRL","A"]
+desktop_type text:"Replacement text"
+desktop_snapshot
+```
+
+Shortcuts depend on the app. If Ctrl+A does not select the text, inspect the
+app instead of assuming the next type operation will replace everything.
+
+## Empir3 / Vincent adapter
+
+Use `browser_control` for browser work and `desktop_control` for native apps.
+The default desktop help shows the common workflow. Request advanced actions
+with `{"type":"help","action":"list","params":{"category":"gui"}}`.
+
+```json
+{"type":"window","action":"list","params":{"title":"Notepad"}}
+{"type":"window","action":"focus","params":{"title":"<unique returned title>"}}
+{"type":"gui","action":"snapshot","params":{"scope":"foreground"}}
+{"type":"gui","action":"click_ref","params":{"ref":"<field ref>"}}
+{"type":"gui","action":"type","params":{"text":"Hello","ref":"<field ref>"}}
+{"type":"gui","action":"snapshot","params":{"scope":"foreground"}}
+```
+
+For pixel-only apps, Empir3 also offers `gui:visual_click` through its configured
+vision model. `mode:"pointer"` previews the proposed target. Inspect that preview
+when uncertain and verify after input; a confidence score alone is not proof.
+
+## Coordinates and movement
+
+Desktop coordinates are physical pixels on the virtual screen. They may be
+negative on monitors left of or above the primary. Browser coordinates are CSS
+pixels within the page viewport. Never substitute one for the other.
+
+For a cropped or resized screenshot, use its returned origin and scale.
+`page_to_screen` maps a browser target to physical coordinates. Monitor/focus
+coordinate modes must be explicit. Prefer refs whenever the app exposes them.
+
+Native actions automatically show a large click-through pointer, quick movement
+and a brief click pulse. The overlay does not take keyboard focus. Hold Escape
+to cancel movement. The automatic cue disappears shortly after the action.
+Foreground browser clicks also show a cue; background browser work does not
+raise a window just to display an animation.
+
+For a tutorial without real mouse input, use `desktop_pointer_show`,
+`desktop_pointer_move`, `desktop_pointer_pulse`, then `desktop_pointer_hide`.
+These visual-only tools do not click. Hide the tutorial pointer when finished.
+
+## Recover once, then report the actual blocker
+
+| Result | Next action |
+| --- | --- |
+| `stale_observation` | Refresh the snapshot and find the intended control again |
+| `desktop_locked` | The user must unlock Windows; input cannot cross the secure desktop |
+| `input_cancelled` / `input_busy` | Let the user's mouse/keyboard action finish, then observe again |
+| Timeout / incomplete input | Inspect fresh state before retrying; some input may have arrived |
+| Empty snapshot | Use the browser tools if this is web content, otherwise vision or a user-selected point |
+| Permission / tool disabled | Explain which setting is needed; preserve the device owner's controls |
+
+## Calibration and testing
+
+Check `desktop_calibration_status` before recalibration. Calibration is an
+attended, per-monitor five-point setup. Run it when topology changes or measured
+click drift warrants it. A missing control or a stale ref is not calibration drift.
+
+Use a disposable `/desktop-test` tab for browser acceptance. Preserve the user's
+existing tabs. The legacy reliability smoke navigates its active tab; never run
+it on unsaved user work. `scripts/smoke-native-control.mjs --run-interactive`
+starts an isolated candidate and disposable native test window on Windows.
+Use `--monitor=1` to repeat on the second display. Add `--small-model` with
+`EMPIR3_TEST_MODEL_URL` and `EMPIR3_TEST_MODEL` for the bounded local-model trial.
+`node scripts/smoke-browser-control.mjs --run-interactive --accuracy` creates
+its own Chrome profile and runs a fresh 103-target physical sweep using a copy
+of this PC's saved calibration. It does not change the installed calibration.
+
+Recording support must be checked against the running version. A failed
+`browser_record_start` is not an active recording; do not call stop to manufacture
+a saved result. The retired page-world overlay is not a recovery path.
+
+## Maintainers
+
+`src/desktop-core-contract.json` owns the core action descriptions shared
+by MCP and the app adapter. From the Bridge worktree, run
+`node scripts/sync-desktop-contract.mjs --app-repo=<app worktree>` and review both
+repos. Use `--check` during release validation. App changes deploy from the app
+keeper; Bridge runtime changes use the private signing/release runbook.
+The new MCP type/key/scroll tools retain the normal explicit tool opt-in.
+Existing companion aliases retain their execute-permission checks.
+
+Keep the success path short. Put exact arguments and recovery hints in tool
+results. Advanced tools should be discoverable on demand. Never teach an action
+that the selected device does not expose.
+
+## Configurable control budgets
+
+Read `bridge_control_catalog` before choosing a large batch. Its `limits` object
+reports this daemon's active workflow, timeout, observation, native input and
+recording budgets. Defaults are a starting point, not fixed tool capacity.
+If a limit rejects a request, split the work or ask the operator to adjust
+**Bridge Settings → Control limits**; never repeat uncertain input.
+
+Operators can save or restore defaults at `/settings#control-limits`, also linked
+from the welcome console and app Admin → Limits. These are local computer
+settings used by MCP, direct calls and connected agents. App turn wrap-up
+percentage and seconds are separate Admin → Limits → Timeouts settings.
