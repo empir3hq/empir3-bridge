@@ -1,0 +1,7 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bridge control lab</title>
+<style>body{font:18px/1.5 system-ui;max-width:780px;margin:40px auto;padding:20px;background:#f5f8f5;color:#17271b}label{display:block;margin:16px 0}input,select,button{font:inherit;padding:10px}button{cursor:pointer}#status{padding:16px;background:#e1eee4}details{margin-top:25px}</style>
+<h1>Bridge control lab</h1><p>A disposable page for testing observation, verified actions, and recording. Nothing leaves this page.</p>
+<label>Name <input id="name" aria-label="Name"></label><label>Team <select id="team"><option value="vincent">Vincent</option><option value="colva">Colva</option></select></label>
+<label><input id="enabled" type="checkbox"> Enable reminders</label><button id="save">Save locally</button><p id="status" role="status">No changes saved</p><details id="details"><summary>Advanced options</summary><p>Advanced tools remain available to every model.</p></details>
+<label>Password test <input id="password" type="password" autocomplete="off"></label>
+<script>let saves=0;document.getElementById('save').onclick=()=>{document.getElementById('status').textContent='Saving…';setTimeout(()=>{document.getElementById('status').textContent='Saved '+(++saves)},180)};</script></html>

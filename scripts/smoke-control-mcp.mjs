@@ -1,0 +1,58 @@
+// Exercise the real stdio MCP contract against an already running disposable fixture.
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
+import {readFileSync,writeFileSync} from 'node:fs';
+import {join,resolve} from 'node:path';
+import assert from 'node:assert/strict';
+const state=process.argv.find(a=>a.startsWith('--state='))?.slice(8);
+if(!state || !state.includes('empir3-browser-acceptance-'))throw Error('Pass the disposable browser acceptance --state path.');
+const configPath=join(state,'.empir3-bridge','config.json'),original=readFileSync(configPath,'utf8');
+const base='http://127.0.0.1:13006';
+const {nonce}=await(await fetch(base+'/api/identity')).json();
+const client=new Client({name:'control-acceptance',version:'1.0.0'});
+const runtimeRoot=process.env.EMPIR3_TEST_RUNTIME_ROOT?resolve(process.env.EMPIR3_TEST_RUNTIME_ROOT):resolve('.');
+const transport=new StdioClientTransport({command:process.execPath,args:process.env.EMPIR3_TEST_RUNTIME_ROOT?['bundle-mcp-server.js']:['--import','tsx','src/mcp-server.ts'],cwd:runtimeRoot,env:{...process.env,BRIDGE_URL:base,EMPIR3_BRIDGE_NONCE:nonce,USERPROFILE:state,APPDATA:join(state,'appdata')},stderr:'pipe'});
+try{
+  const initial=JSON.parse(original);Object.assign(initial.enabledTools,{browser_type:true,browser_click:true,browser_play:true,desktop_click_page:true,browser_tab_open:true,browser_tab_close:true});writeFileSync(configPath,JSON.stringify(initial));
+  await client.connect(transport);
+  const tools=(await client.listTools()).tools;
+  for(const name of ['bridge_control_observe','bridge_control_activate','browser_tab_open','browser_tab_close','bridge_control_run','bridge_control_catalog','bridge_control_status','bridge_control_diagnostics','browser_evaluate','desktop_drag'])assert.ok(tools.some(t=>t.name===name),name);
+  assert.ok(tools.find(t=>t.name==='desktop_drag').inputSchema.properties.target);
+  const tabs=await(await fetch('http://127.0.0.1:19867/tabs')).json();
+  let target={surface:'browser',tabId:tabs.currentTargetId};
+  const call=async(name,args)=>{const r=await client.callTool({name,arguments:args});return {error:r.isError,text:r.content.filter(c=>c.type==='text').map(c=>c.text).join('\n')};};
+  const opened=await call('browser_tab_open',{url:base+'/control-lab'});assert.ok(!opened.error,opened.text);target=JSON.parse(opened.text).target;
+  await call('browser_tab_focus',{action:'user_focus',targetId:target.tabId});
+  const handed=await call('bridge_control_activate',{target});assert.ok(!handed.error,handed.text);
+  const observed=await call('bridge_control_observe',{target,image:false});assert.ok(!observed.error,observed.text);
+  const steps=[{action:'fill',locator:{selector:'#name'},value:'MCP verified',expect:{kind:'value',locator:{selector:'#name'},equals:'MCP verified'}}];
+  const passed=await call('bridge_control_run',{target,steps});assert.ok(!passed.error,passed.text);assert.equal(JSON.parse(passed.text).receipts[0].verified,true);
+  const stopped=await call('bridge_control_run',{target,steps:[...steps,{action:'click',locator:{selector:'#missing'}},{action:'fill',locator:{selector:'#name'},value:'Must never run'}]});
+  assert.ok(stopped.error,stopped.text);assert.equal(JSON.parse(stopped.text).receipts.length,2);assert.equal(JSON.parse(stopped.text).receipts[0].verified,true);
+  // Real MCP formatting is part of acceptance, not only the daemon result.
+  const playback=await call('browser_play',{recording:'control-acceptance.json',target});assert.ok(!playback.error,playback.text);
+  const played=JSON.parse(playback.text);assert.equal(played.mode,'verified-control-recording');assert.ok(played.name);assert.ok(played.completed>0);assert.ok(played.results.length>0);assert.ok(!playback.text.includes('undefined'));
+  writeFileSync(join(state,'recordings','mcp-failure.json'),JSON.stringify({name:'MCP stop receipt',controlVersion:2,controlSteps:[{action:'click',locator:{selector:'#missing'}},{action:'fill',locator:{selector:'#name'},value:'Must never run'}]}));
+  const replayFailure=await call('browser_play',{recording:'mcp-failure.json',target});assert.ok(replayFailure.error);assert.equal(JSON.parse(replayFailure.text).results.length,1);
+  writeFileSync(join(state,'recordings','mcp-malformed.json'),'{broken fixture');
+  const recordingList=await(await fetch(base+'/api/recordings')).json();
+  assert.equal(recordingList.find(r=>r.file==='mcp-failure.json').actionCount,2);
+  assert.equal(recordingList.find(r=>r.file==='mcp-malformed.json').valid,false);
+  assert.ok((await fetch(base+'/api/status')).ok,'Invalid recording must not crash the daemon');
+  const savedBefore=Number(JSON.parse((await call('bridge_control_observe',{target,image:false})).text).observation.text.match(/Saved (\d+)/)?.[1]||0);
+  const pageClick=await call('desktop_click_page',{selector:'#save'});assert.ok(!pageClick.error,pageClick.text);
+  const savedAfter=Number(JSON.parse((await call('bridge_control_observe',{target,image:false})).text).observation.text.match(/Saved (\d+)/)?.[1]||0);
+  assert.equal(savedAfter,savedBefore+1,'Page-to-desktop click must change the actual app counter exactly once');
+  const cfg=JSON.parse(original);cfg.enabledTools.browser_type=false;writeFileSync(configPath,JSON.stringify(cfg));
+  const denied=await call('bridge_control_run',{target,steps});assert.ok(denied.error);assert.match(denied.text,/disabled locally/);
+  const mismatch=await call('desktop_key',{target,keys:['TAB']});assert.ok(mismatch.error);assert.match(mismatch.text,/target_mismatch/);
+  const cat=await call('bridge_control_catalog',{});assert.equal(JSON.parse(cat.text).modelRestricted,false);
+  writeFileSync(configPath,JSON.stringify(initial));
+  const closed=await call('browser_tab_close',{target});assert.ok(!closed.error,closed.text);
+  const after=await call('browser_tab_state',{});assert.ok(!after.text.includes(target.tabId),after.text);
+  const stale=await call('bridge_control_observe',{target,image:false});assert.ok(stale.error);assert.match(stale.text,/target_closed/);
+  const live=await(await fetch('http://127.0.0.1:19867/tabs')).json();
+  const status=JSON.parse((await call('browser_status',{})).text);assert.equal(status.pageCount,live.tabs.length);assert.equal(status.currentUrl||null,live.tabs.find(t=>t.targetId===live.currentTargetId)?.url||null);
+  const receipt={passed:true,toolCount:tools.length,advancedRetained:true,explicitTargetSchema:true,mcpWorkflowVerified:true,nestedPermissionDenial:true,targetMismatchRejected:true,structuredFailureReceipts:true,recordingReceipts:true,explicitHandoff:true,exactTabLifecycle:true,freshStatus:true,pageClickExecuted:true};
+  writeFileSync(join(state,'mcp-receipt.json'),JSON.stringify(receipt,null,2));console.log(JSON.stringify(receipt));
+}finally{writeFileSync(configPath,original);await client.close();}
