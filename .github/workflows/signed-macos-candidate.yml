@@ -1,0 +1,148 @@
+name: Signed macOS candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A second manual dispatch queues instead of starting another expensive Apple
+# notarization sequence in parallel. Never cancel a run after Apple has begun
+# processing submissions; let it reach its cleanup step.
+concurrency:
+  group: signed-macos-candidate
+  cancel-in-progress: false
+
+jobs:
+  signed-macos-universal:
+    name: Developer ID signed and notarized universal DMG
+    runs-on: macos-latest
+    timeout-minutes: 90
+    environment:
+      name: macos-signing-held
+    env:
+      EMPIR3_SIGN_MACOS: '1'
+      EMPIR3_RELEASE_SIGNED: '1'
+      EMPIR3_DESKTOP_ARCH: universal
+      EMPIR3_MAC_SIGN_IDENTITY: ${{ secrets.EMPIR3_MAC_SIGN_IDENTITY }}
+      EMPIR3_MAC_CERT_P12_B64: ${{ secrets.EMPIR3_MAC_CERT_P12_B64 }}
+      EMPIR3_MAC_CERT_PASSWORD: ${{ secrets.EMPIR3_MAC_CERT_PASSWORD }}
+      APPLE_API_KEY_P8_B64: ${{ secrets.APPLE_API_KEY_P8_B64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use Node.js 22.17
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.17.0
+
+      - name: Install Bridge dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Install desktop packaging dependencies
+        run: npm ci --prefix desktop-shell --no-audit --no-fund
+
+      - name: Import ephemeral Developer ID identity and notary key
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in EMPIR3_MAC_SIGN_IDENTITY EMPIR3_MAC_CERT_P12_B64 EMPIR3_MAC_CERT_PASSWORD APPLE_API_KEY_P8_B64 APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required macOS candidate secret $name is not configured"
+              exit 1
+            fi
+          done
+
+          certificate_path="$RUNNER_TEMP/empir3-developer-id.p12"
+          api_key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          keychain_path="$RUNNER_TEMP/empir3-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$keychain_password"
+
+          printf '%s' "$EMPIR3_MAC_CERT_P12_B64" | openssl base64 -d -A -out "$certificate_path"
+          printf '%s' "$APPLE_API_KEY_P8_B64" | openssl base64 -d -A -out "$api_key_path"
+          chmod 600 "$certificate_path" "$api_key_path"
+          test -s "$certificate_path"
+          test -s "$api_key_path"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" -P "$EMPIR3_MAC_CERT_PASSWORD" -A -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" "$HOME/Library/Keychains/login.keychain-db"
+
+          echo "APPLE_API_KEY=$api_key_path" >> "$GITHUB_ENV"
+          echo "EMPIR3_MAC_CI_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+          echo "EMPIR3_MAC_CI_CERTIFICATE=$certificate_path" >> "$GITHUB_ENV"
+          echo "EMPIR3_MAC_CI_API_KEY=$api_key_path" >> "$GITHUB_ENV"
+
+      - name: Verify Apple identity and notarization access
+        run: npm run release:signing-preflight -- --platform macos --online
+
+      - name: Build signed and notarized universal artifacts
+        run: npm run desktop:make
+
+      - name: Verify Developer ID, Gatekeeper, and stapled tickets
+        run: npm run desktop:verify-signatures
+
+      - name: Smoke signed packaged app
+        run: npm run desktop:package-smoke
+
+      - name: Smoke signed DMG installer lifecycle
+        run: npm run desktop:installer-smoke:macos
+
+      - name: Record signed artifact hashes
+        run: npm run desktop:artifacts
+
+      - name: Preserve signed base candidate and prepare next version
+        shell: bash
+        run: |
+          mv desktop-shell/out "$RUNNER_TEMP/empir3-macos-base-out"
+          next_version="$(node desktop-shell/scripts/prepare-macos-update-version.cjs)"
+          echo "EMPIR3_MAC_UPDATE_NEXT_VERSION=$next_version" >> "$GITHUB_ENV"
+
+      - name: Build signed and notarized next-version acceptance candidate
+        run: npm run desktop:make
+
+      - name: Verify next-version Developer ID and stapled tickets
+        run: npm run desktop:verify-signatures
+
+      - name: Record signed next-version artifact hashes
+        run: npm run desktop:artifacts
+
+      - name: Smoke signed macOS update and rollback lifecycle
+        env:
+          EMPIR3_MAC_UPDATE_BASE_ROOT: ${{ runner.temp }}/empir3-macos-base-out/make
+          EMPIR3_MAC_UPDATE_NEXT_ROOT: ${{ github.workspace }}/desktop-shell/out/make
+        run: npm run desktop:update-smoke:macos
+
+      - name: Upload held signed candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: empir3-bridge-macos-universal-signed-candidate
+          path: |
+            ${{ runner.temp }}/empir3-macos-base-out/make/**
+            ${{ runner.temp }}/empir3-macos-base-out/artifacts.json
+            desktop-shell/out/make/**
+            desktop-shell/out/artifacts.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove ephemeral Apple material
+        if: always()
+        shell: bash
+        run: |
+          # Use deterministic runner-temp paths as well as the exported values.
+          # This still cleans up if decoding or keychain import failed before
+          # the import step could append variables to GITHUB_ENV.
+          keychain_path="${EMPIR3_MAC_CI_KEYCHAIN:-$RUNNER_TEMP/empir3-signing.keychain-db}"
+          certificate_path="${EMPIR3_MAC_CI_CERTIFICATE:-$RUNNER_TEMP/empir3-developer-id.p12}"
+          api_key_path="${EMPIR3_MAC_CI_API_KEY:-$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID:-missing}.p8}"
+          security delete-keychain "$keychain_path" >/dev/null 2>&1 || true
+          rm -f "$certificate_path" "$api_key_path"
