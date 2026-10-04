@@ -1,0 +1,3038 @@
+/**
+ * Empir3 Browser Bridge — CDP Server
+ *
+ * Empir3's own CDP bridge. Launches Chrome with remote debugging,
+ * exposes the same HTTP API surface on the same port (default 9867).
+ *
+ * Zero external dependencies — uses Node built-ins + raw CDP WebSocket.
+ *
+ * Endpoints:
+ *   GET  /health           — readiness check
+ *   GET  /screenshot       — viewport capture (JPEG)
+ *   GET  /snapshot         — accessibility tree element refs
+ *   GET  /text             — extract readable page text
+ *   GET  /tabs             — list open tabs
+ *   POST /navigate         — load URL
+ *   POST /action           — click/type/press/scroll by ref
+ *   POST /evaluate         — run JavaScript
+ *   POST /cookies          — set cookies
+ *   GET  /welcome          — redirect to the maintained wrapper console
+ */
+
+import { createServer, IncomingMessage, ServerResponse, request as httpRequest } from 'http';
+import { spawn, ChildProcess } from 'child_process';
+import { WebSocket } from 'ws';
+import { join, resolve } from 'path';
+import { mkdirSync, existsSync, readFileSync } from 'fs';
+import { badgeTitleExpression, sanitizeAgentName } from './tab-badge.js';
+import { shouldRetryScreenshotCdpFailure, shouldRetryCdpCommand } from './browser-request-policy.js';
+import { browserScrollExpression } from './browser-scroll.js';
+import { emulationConsistency } from './device-emulation-check.js';
+import { browserMonitorInput } from './monitor-control.js';
+import { removeStaleChromeSingletons } from './chrome-profile-locks.js';
+import { BrowserRecorder } from './browser-recorder.js';
+import { viewportClip } from './screenshotClip.js';
+import { cdpHttpRefusal } from './cdp-http-boundary.js';
+import { createBrowserDialogs } from './browser-dialogs.js';
+import { browserActionPointExpression, retargetEditableExpression } from './browser-action-point.js';
+import { browserRefusal, browserActionFailure } from './browser-refusal.js';
+import { PAGE_READINESS_EXPRESSION, waitForBrowserPage } from './browser-page.js';
+
+const browserDialogs = createBrowserDialogs(openPageCdpSession);
+const browserRecorder=new BrowserRecorder();
+
+// ─── Config ──────────────────────────────────────────────────
+
+const PORT = parseInt(process.env.BRIDGE_PORT || '9867');
+const WRAPPER_PORT = parseInt(process.env.PW_PORT || process.env.EMPIR3_PW_PORT || '3006');
+const HOST = process.env.EMPIR3_BRIDGE_HOST || '127.0.0.1';
+// The packaged release smoke runs on hosted Windows workers where no reliable
+// interactive desktop is guaranteed. Keep that narrowly scoped browser-only
+// switch separate from BRIDGE_HEADLESS so the daemon still exercises its
+// workstation surface while Chrome uses headless CDP.
+const HEADLESS = process.env.BRIDGE_HEADLESS === 'true'
+  || process.env.EMPIR3_CHROME_HEADLESS === '1';
+const CDP_PORT = parseInt(process.env.CDP_PORT || '9222');
+const CHROME_PATHS = [
+  process.env.CHROME_PATH,
+  'C:/Program Files/Google/Chrome/Application/chrome.exe',
+  'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium-browser',
+  '/usr/bin/chromium',      // Debian/Fedora package name
+  '/snap/bin/chromium',     // Ubuntu ships Chromium as a snap
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+].filter(Boolean) as string[];
+
+// Lazy Chromium: when '0', main() skips the eager launch and the first
+// browser tool call starts Chrome via ensureChromeReady(). Default for the
+// headless entrypoint (src/headless-entry.js) — a 2GB VPS should not spend
+// ~300MB on a browser nobody has asked for yet.
+const CHROME_AUTOLAUNCH = process.env.EMPIR3_CHROME_AUTOLAUNCH !== '0';
+
+const PROFILE_DIR = process.env.BRIDGE_PROFILE || process.env.EMPIR3_BRIDGE_CHROME_PROFILE || join(
+  process.env.HOME || process.env.USERPROFILE || '.',
+  '.empir3-bridge', 'profile'
+);
+
+const SESSION_TOKEN = process.env.BRIDGE_TOKEN || '';
+const NAV_TIMEOUT = parseInt(process.env.BRIDGE_NAV_TIMEOUT || '60') * 1000;
+const CDP_COMMAND_TIMEOUT_MS = parseInt(process.env.BRIDGE_CDP_COMMAND_TIMEOUT_MS || '10000');
+const CDP_LIVENESS_MAX_AGE_MS = parseInt(process.env.BRIDGE_CDP_LIVENESS_MAX_AGE_MS || '2000');
+const CDP_LIVENESS_TIMEOUT_MS = parseInt(process.env.BRIDGE_CDP_LIVENESS_TIMEOUT_MS || '2500');
+const CDP_PERMISSION_TIMEOUT_MS = parseInt(process.env.BRIDGE_CDP_PERMISSION_TIMEOUT_MS || '500');
+const CHROME_LAUNCH_TIMEOUT_MS = Math.max(
+  15000,
+  Number.parseInt(process.env.CHROME_LAUNCH_TIMEOUT_MS || process.env.BRIDGE_CHROME_LAUNCH_TIMEOUT_MS || '90000', 10) || 90000,
+);
+
+// ─── State ───────────────────────────────────────────────────
+
+let chromeProcess: ChildProcess | null = null;
+let cdpWs: WebSocket | null = null;
+let cdpId = 1;
+const cdpCallbacks = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; ws: WebSocket }>();
+let currentTargetId = '';
+let currentSessionId = '';
+let connected = false;
+
+// Target tracking — detect new tabs and inject scripts
+const knownTargets = new Map<string, string>(); // targetId → last known URL
+let autoInjectScript = ''; // script to inject into every new page target
+let targetPollTimer: ReturnType<typeof setInterval> | null = null;
+
+// 0.3.46 per-agent tabs: which agent's badge each tab carries. Set via
+// POST /tab-badge (the wrapper resolves WHICH tab is whose); re-stamped on
+// every navigation because page loads reset document.title. Best-effort by
+// contract — a stamp failure must never fail a command.
+const tabBadges = new Map<string, string>(); // targetId → agentName
+
+async function stampTabBadge(targetId: string): Promise<void> {
+  const agentName = tabBadges.get(targetId);
+  if (!agentName) return;
+  try {
+    await evaluateOnTarget(targetId, badgeTitleExpression(agentName), 3000);
+  } catch { /* best-effort: page mid-load or gone; the next nav re-stamps */ }
+}
+
+// Browser-level CDP connection for target discovery
+let browserWs: WebSocket | null = null;
+let browserCdpId = 100000; // offset from page-level IDs to avoid collision
+const browserCallbacks = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+let browserWsConnecting = false;
+let browserReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let launchPromise: Promise<void> | null = null;
+let lastCdpLivenessAt = 0;
+let chromeEverStarted = false;
+let chromeExitCode: number | null = null;
+let chromeExitSignal: NodeJS.Signals | null = null;
+let chromeStderrTail = '';
+let chromeClosedByUser = false;
+let chromeLaunchGeneration = 0;
+let chromeLaunchInFlightGeneration = 0;
+let shuttingDown = false;
+let cdpCommandQueue: Promise<void> = Promise.resolve();
+
+// Element ref tracking
+let snapshotSequence = 0;
+
+// --fresh state — only wipe storage on the FIRST CDP connect of this Chrome
+// launch. CDP can reconnect mid-session (Chrome reload, target switch); we
+// don't want each reconnect re-wiping the user's just-typed-in cookies.
+let freshConsumed = false;
+
+// ─── Chrome Launcher ─────────────────────────────────────────
+
+function findChrome(): string {
+  for (const p of CHROME_PATHS) {
+    if (existsSync(p)) return p;
+  }
+  throw new Error(
+    process.platform === 'win32'
+      ? 'Chrome not found. Set CHROME_PATH env var.'
+      : 'Chrome/Chromium not found. Install it (e.g. apt install chromium) or set CHROME_PATH.',
+  );
+}
+
+function chromeStatus(): 'running' | 'exited' | 'not-started' {
+  if (chromeProcess) return 'running';
+  return chromeEverStarted ? 'exited' : 'not-started';
+}
+
+function closedBrowserError(): Error {
+  return new Error('Bridge browser is closed. Use browser_navigate or Open Bridge to reopen it.');
+}
+
+function markChromeClosedByUser(reason: string) {
+  if (!chromeClosedByUser) {
+    console.log(`[Empir3 Bridge] Bridge browser closed by user (${reason})`);
+  }
+  chromeClosedByUser = true;
+  connected = false;
+  lastCdpLivenessAt = 0;
+  currentTargetId = '';
+  knownTargets.clear();
+  if (cdpWs) { try { cdpWs.close(); } catch {} }
+  cdpWs = null;
+  stopTargetPolling();
+  if (browserReconnectTimer) {
+    clearTimeout(browserReconnectTimer);
+    browserReconnectTimer = null;
+  }
+  if (browserWs) { try { browserWs.close(); } catch {} }
+  browserWs = null;
+}
+
+// Guards against stacking concurrent close-confirmation checks (pollTargets can
+// fire one every 500ms while a check is still mid-flight).
+let closeCheckInFlight = false;
+
+// A single empty /json read is NOT proof the user closed the browser: during a
+// cross-process navigation Chrome briefly destroys the old page target before the
+// new one appears, and a refresh momentarily yields zero/changing targets. Latch
+// "closed by user" only after several consecutive confirmations (~500ms) while the
+// browser was previously reachable. The tracked process can be only a Windows
+// launcher that has already handed off and exited, so process presence is not
+// a browser-liveness requirement. This kills the post-refresh ONLINE->OFFLINE
+// flap without losing genuine close detection after a launcher hand-off.
+async function markClosedIfNoPageTargets(reason: string): Promise<void> {
+  if (chromeClosedByUser || shuttingDown) return;
+  if (closeCheckInFlight) return;
+  closeCheckInFlight = true;
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (chromeClosedByUser || shuttingDown) return;
+      try {
+        const targets = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+        if (targets.some((t: any) => t.type === 'page')) return; // a page reappeared — not closed
+      } catch {
+        return; // /json hiccup — inconclusive; never latch closed on an error
+      }
+      if (attempt < 2) await sleep(250);
+    }
+    if (chromeClosedByUser || shuttingDown) return;
+    markChromeClosedByUser(reason);
+  } finally {
+    closeCheckInFlight = false;
+  }
+}
+
+async function terminateClosedChromeForRelaunch(): Promise<void> {
+  const proc = chromeProcess;
+  if (!proc) return;
+  try { proc.kill(); } catch {}
+  const deadline = Date.now() + 3000;
+  while (chromeProcess === proc && Date.now() < deadline) {
+    await sleep(100);
+  }
+  if (chromeProcess === proc) {
+    chromeProcess = null;
+  }
+}
+
+async function waitForChromeCDP(timeoutMs = CHROME_LAUNCH_TIMEOUT_MS): Promise<void> {
+  const start = Date.now();
+  const recovery = `Restart the Bridge and choose Open browser again. If it still fails, quit the Bridge, rename the Chrome profile folder "${PROFILE_DIR}" to "${PROFILE_DIR}-old", and restart. Keep the old folder so you can restore its saved sign-ins. Use Report a problem to share the launch log.`;
+  let lastError: any = null;
+  while (Date.now() - start < timeoutMs) {
+    // Chrome's Windows launcher may exit cleanly after handing the profile to
+    // the real browser process. CDP is the authority, so probe it before using
+    // the tracked child exit as failure evidence and allow a short hand-off.
+    try {
+      await connectCDP();
+      return;
+    } catch (e) {
+      lastError = e;
+    }
+    if (
+      !chromeProcess &&
+      chromeEverStarted &&
+      Date.now() - start >= 2000 &&
+      (chromeExitCode !== 0 || chromeExitSignal)
+    ) {
+      const exit = chromeExitCode != null
+        ? `code ${chromeExitCode}`
+        : chromeExitSignal
+          ? `signal ${chromeExitSignal}`
+          : 'unknown exit';
+      const stderr = chromeStderrTail.trim().replace(/\s+/g, ' ').slice(-1000);
+      const suffix = stderr ? ` (${exit}: ${stderr})` : ` (${exit})`;
+      throw new Error(`Chrome exited before CDP connected${suffix}. ${recovery}`);
+    }
+    await sleep(250);
+  }
+  const detail = lastError?.message ? `: ${lastError.message}` : '';
+  throw new Error(`Chrome did not expose CDP within ${Math.round(timeoutMs / 1000)}s${detail}. ${recovery}`);
+}
+
+async function launchChrome(timeoutMs = CHROME_LAUNCH_TIMEOUT_MS): Promise<void> {
+  if (chromeProcess) {
+    await waitForChromeCDP(timeoutMs);
+    return;
+  }
+  if (await reopenTargetOnReachableChrome()) return;
+
+  const chromePath = findChrome();
+
+  // Ensure profile directory exists
+  mkdirSync(PROFILE_DIR, { recursive: true });
+
+  // Chromium can leave Singleton* symlinks behind after a VPS reboot or hard
+  // kill. Remove them only when the lock encodes an owner PID and the kernel
+  // proves that PID no longer exists; malformed or live locks remain intact.
+  const staleLocks = removeStaleChromeSingletons(PROFILE_DIR);
+  if (staleLocks.removed.length) {
+    console.log(`[Empir3 Bridge] Removed stale Chrome profile locks from dead PID ${staleLocks.pid}: ${staleLocks.removed.join(', ')}`);
+  }
+
+  const args = [
+    `--remote-debugging-port=${CDP_PORT}`,
+    '--remote-debugging-address=127.0.0.1',
+    `--user-data-dir=${PROFILE_DIR}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-background-networking',
+    '--disable-default-apps',
+    '--disable-sync',
+    '--disable-translate',
+    '--metrics-recording-only',
+    '--safebrowsing-disable-auto-update',
+    '--disable-session-crashed-bubble',
+    '--restore-last-session',
+    '--hide-crash-restore-bubble',
+    '--disable-popup-blocking',
+    '--disable-notifications',
+    '--autoplay-policy=no-user-gesture-required',
+    '--deny-permission-prompts',
+    '--disable-permissions-api',
+  ];
+
+  if (HEADLESS) {
+    args.push('--headless=new');
+  }
+  if (process.platform === 'linux') {
+    args.push('--disable-dev-shm-usage');
+  }
+  // Sandboxing remains enabled for every normal installation. Hosted Linux
+  // runners can explicitly opt out because their nested sandbox is unavailable.
+  if (process.env.EMPIR3_CHROME_DISABLE_SANDBOX === '1') {
+    args.push('--no-sandbox', '--disable-setuid-sandbox');
+  }
+
+  // Start with welcome page. If a per-launch nonce was provided, stamp it on
+  // the URL — page scripts read it and use /api/identity to pick the right
+  // wrapper port when multiple bridges are running.
+  const nonce = process.env.EMPIR3_BRIDGE_NONCE || '';
+  const welcomePort = String(WRAPPER_PORT || PORT);
+  // Passing a startup URL alongside restore-last-session opens an additional
+  // console on every restart. Let Chromium restore its own session first;
+  // pickInitialTarget opens a console if the restored session has none.
+  if (!existsSync(join(PROFILE_DIR, 'Default', 'Sessions'))) {
+    args.push(nonce
+      ? `http://localhost:${welcomePort}/welcome?bridgeNonce=${encodeURIComponent(nonce)}`
+      : `http://localhost:${welcomePort}/welcome`);
+  }
+
+  console.log(`[Empir3 Bridge] Launching Chrome: ${chromePath}`);
+  console.log(`[Empir3 Bridge] Chrome profile: ${PROFILE_DIR}`);
+  chromeEverStarted = true;
+  chromeExitCode = null;
+  chromeExitSignal = null;
+  chromeStderrTail = '';
+  chromeClosedByUser = false;
+  const launchGeneration = ++chromeLaunchGeneration;
+  chromeLaunchInFlightGeneration = launchGeneration;
+  const launchedProcess = spawn(chromePath, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: false,
+  });
+  chromeProcess = launchedProcess;
+
+  launchedProcess.stderr?.on('data', (d: Buffer) => {
+    const line = d.toString().trim();
+    if (line) chromeStderrTail = `${chromeStderrTail}\n${line}`.slice(-4000);
+    if (line && !line.includes('DevTools listening')) {
+      // Suppress noisy Chrome stderr
+    }
+  });
+
+  launchedProcess.on('exit', (code, signal) => {
+    console.log(`[Empir3 Bridge] Chrome launcher exited (code ${code}, signal ${signal || 'none'})`);
+    const ownsTrackedProcess = chromeProcess === launchedProcess;
+    if (ownsTrackedProcess) {
+      chromeExitCode = code;
+      chromeExitSignal = signal;
+      chromeProcess = null;
+    }
+    if (shuttingDown) {
+      connected = false;
+      cdpWs = null;
+      stopTargetPolling();
+      if (browserReconnectTimer) {
+        clearTimeout(browserReconnectTimer);
+        browserReconnectTimer = null;
+      }
+      if (browserWs) { try { browserWs.close(); } catch {} }
+      browserWs = null;
+    } else if (ownsTrackedProcess) {
+      void confirmChromeProcessExit(launchGeneration);
+    }
+  });
+
+  try {
+    await waitForChromeCDP(timeoutMs);
+  } finally {
+    if (chromeLaunchInFlightGeneration === launchGeneration) {
+      chromeLaunchInFlightGeneration = 0;
+    }
+  }
+}
+
+async function reopenTargetOnReachableChrome(): Promise<boolean> {
+  try {
+    // Closing the final page does not guarantee the browser process exits;
+    // Chrome may keep its browser-level CDP endpoint alive with zero targets.
+    // A user-requested navigate should reuse that owned process before spawning.
+    const version = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json/version`, 'GET', 1000);
+    if (!version?.webSocketDebuggerUrl) return false;
+    await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json/new?about:blank`, 'PUT', 1500);
+    await sleep(150);
+    await connectCDP();
+    chromeClosedByUser = false;
+    startTargetPolling();
+    connectBrowserWs().catch(() => {});
+    console.log('[Empir3 Bridge] Reopened a page in the reachable Chrome process');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A spawned Chrome process is not necessarily the browser process. On Windows
+ * it commonly hands the profile to another process and exits while CDP remains
+ * healthy. Confirm the browser itself is gone before latching a user close.
+ */
+async function confirmChromeProcessExit(launchGeneration: number): Promise<void> {
+  // Do not race the launch health gate. A clean launcher may exit before the
+  // handed-off browser publishes its first CDP target, especially on relaunch.
+  while (chromeLaunchInFlightGeneration === launchGeneration) {
+    if (shuttingDown || launchGeneration !== chromeLaunchGeneration || chromeProcess) return;
+    if (await hasReachablePageTarget(500)) {
+      chromeClosedByUser = false;
+      startTargetPolling();
+      connectBrowserWs().catch(() => {});
+      console.log('[Empir3 Bridge] Chrome launcher handed off; browser remains reachable');
+      return;
+    }
+    await sleep(250);
+  }
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (shuttingDown || launchGeneration !== chromeLaunchGeneration || chromeProcess) return;
+    if (await hasReachablePageTarget()) {
+      chromeClosedByUser = false;
+      startTargetPolling();
+      connectBrowserWs().catch(() => {});
+      console.log('[Empir3 Bridge] Chrome launcher handed off; browser remains reachable');
+      return;
+    }
+    if (attempt < 5) await sleep(250);
+  }
+  if (!shuttingDown && launchGeneration === chromeLaunchGeneration && !chromeProcess) {
+    markChromeClosedByUser('browser process exit confirmed');
+  }
+}
+
+async function ensureChromeReady(opts: { allowRelaunch?: boolean; launchTimeoutMs?: number } = {}): Promise<void> {
+  const allowRelaunch = opts.allowRelaunch === true;
+  const launchTimeoutMs = Math.max(1000, opts.launchTimeoutMs || CHROME_LAUNCH_TIMEOUT_MS);
+  // Restored targets appear before their navigation and CDP attachment settle.
+  // Share the launch gate before interpreting target metadata as readiness.
+  if (launchPromise) await launchPromise;
+  // A reachable page is stronger evidence than the process latch. This also
+  // self-heals daemon launcher hand-offs observed before this release.
+  if (await hasReachablePageTarget()) {
+    if (chromeClosedByUser) {
+      console.log('[Empir3 Bridge] Clearing stale closed-browser latch; CDP page is reachable');
+    }
+    chromeClosedByUser = false;
+    startTargetPolling();
+    return;
+  }
+  if (chromeClosedByUser && !allowRelaunch) {
+    throw closedBrowserError();
+  }
+  if (chromeClosedByUser && allowRelaunch && await reopenTargetOnReachableChrome()) {
+    return;
+  }
+  if (chromeClosedByUser && allowRelaunch && chromeProcess) {
+    await terminateClosedChromeForRelaunch();
+  }
+  if (chromeClosedByUser && !allowRelaunch) {
+    throw closedBrowserError();
+  }
+  if (launchPromise) {
+    await launchPromise;
+    if (await hasReachablePageTarget()) return;
+    if (chromeClosedByUser && !allowRelaunch) {
+      throw closedBrowserError();
+    }
+  }
+
+  launchPromise = (async () => {
+    if (chromeProcess) {
+      try {
+        await waitForChromeCDP(launchTimeoutMs);
+        startTargetPolling();
+        connectBrowserWs().catch(() => {});
+        return;
+      } catch (e: any) {
+        if (chromeProcess) throw e;
+        console.warn(`[Empir3 Bridge] Existing Chrome exited during startup: ${e?.message || e}`);
+        await sleep(800);
+      }
+    }
+
+    if (chromeClosedByUser && !allowRelaunch) {
+      throw closedBrowserError();
+    }
+    await launchChrome(launchTimeoutMs);
+    startTargetPolling();
+    connectBrowserWs().catch(() => {});
+  })();
+
+  try {
+    await launchPromise;
+  } finally {
+    launchPromise = null;
+  }
+}
+
+async function showChromeWindow(preferredUrl?: string): Promise<string> {
+  let href = preferredUrl || `http://localhost:${WRAPPER_PORT || PORT}/welcome`;
+
+  try {
+    await ensureChromeReady({ allowRelaunch: true, launchTimeoutMs: 5000 });
+  } catch (e: any) {
+    if (chromeProcess) {
+      console.warn(`[Empir3 Bridge] Open Bridge launched Chrome, but CDP was not ready yet: ${e?.message || e}`);
+      return href;
+    }
+    throw e;
+  }
+
+  if (!preferredUrl) {
+    href = '';
+  }
+  if (!href) {
+    try {
+      const current = await cdpEvaluate('location.href', 1000);
+      href = typeof current === 'string' && current ? current : '';
+    } catch {}
+  }
+  if (!href || href === 'about:blank') href = `http://localhost:${WRAPPER_PORT || PORT}/welcome`;
+
+  try {
+    const info = await cdpSend('Browser.getWindowForTarget', { targetId: currentTargetId }, 1000);
+    // Raising a tab must preserve a user's maximized/fullscreen geometry.
+    // Restoring every window here also races page-to-screen measurements.
+    if (info?.windowId && info?.bounds?.windowState === 'minimized') {
+      await cdpSend('Browser.setWindowBounds', {
+        windowId: info.windowId,
+        bounds: { windowState: 'normal' },
+      }, 1000);
+    }
+  } catch {}
+
+  try { await cdpSend('Page.bringToFront', {}, 1000); } catch {}
+
+  try {
+    const current = await cdpEvaluate('location.href', 1000);
+    if (!current || current === 'about:blank') {
+      await cdpNavigate(href);
+    }
+  } catch {
+    await cdpNavigate(href);
+  }
+
+  try { await cdpSend('Page.bringToFront', {}, 1000); } catch {}
+  return href;
+}
+
+// ─── CDP Connection ──────────────────────────────────────────
+
+/**
+ * Reconnect to the selected page, or select/create our own console without
+ * navigating a restored user page. Passive lookups refuse an empty browser;
+ * an explicit connection may create its first console.
+ */
+async function pickInitialTarget(allowEmpty = false): Promise<any> {
+  let res = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+  let pages = res.filter((t: any) => t.type === 'page');
+  // Only an explicit connection/launch may create a missing first page.
+  // Passive health probes must preserve a browser the user closed.
+  if (pages.length === 0 && !allowEmpty) throw new Error('No page targets');
+
+  // Reconnect to the selected page when it still exists. On a new browser
+  // session select our console, so the reused tray's welcome navigation cannot
+  // replace a restored user page. Restoring a tab does not hand it to an agent.
+  const selected = pages.find((t: any) => t.id === currentTargetId);
+  if (selected) return selected;
+  const consoleTab = pages.find((t: any) => {
+    try {
+      const url = new URL(t.url);
+      return url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)
+        && url.port === String(WRAPPER_PORT || PORT) && url.pathname === '/welcome';
+    } catch { return false; }
+  });
+  if (consoleTab) return consoleTab;
+
+  const nonce = process.env.EMPIR3_BRIDGE_NONCE || '';
+  const welcome = `http://localhost:${WRAPPER_PORT || PORT}/welcome`
+    + (nonce ? `?bridgeNonce=${encodeURIComponent(nonce)}` : '');
+  const created = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json/new?${encodeURIComponent(welcome)}`, 'PUT');
+  if (!created?.id || !created.webSocketDebuggerUrl) throw new Error('Could not open the Bridge console without replacing a restored page.');
+  return created;
+}
+
+async function connectCDP(): Promise<void> {
+  const target = await pickInitialTarget(true);
+  currentTargetId = target.id;
+
+  if (cdpWs) {
+    cdpWs.close();
+  }
+
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(target.webSocketDebuggerUrl);
+    let settled = false;
+    const timer = setTimeout(() => fail(new Error('CDP WebSocket timeout')), 5000);
+    const fail = (e: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (cdpWs === ws) {
+        connected = false;
+        cdpWs = null;
+        lastCdpLivenessAt = 0;
+      }
+      try { ws.close(); } catch {}
+      reject(e);
+    };
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+
+    ws.on('open', async () => {
+      cdpWs = ws;
+      connected = true;
+      lastCdpLivenessAt = 0;
+      console.log(`[Empir3 Bridge] CDP connected to: ${target.url}`);
+
+      // Launch readiness belongs to the browser process. A restored renderer
+      // may be stalled or not yet ready to evaluate JavaScript; ordinary page
+      // commands keep their separate liveness/timeout checks.
+      try {
+        await ensureBrowserWsReady(CDP_LIVENESS_TIMEOUT_MS);
+        await browserSend('Browser.getVersion', {}, CDP_LIVENESS_TIMEOUT_MS);
+      } catch (error: any) {
+        fail(new Error(`CDP browser readiness check failed: ${error?.message || error}`));
+        return;
+      }
+
+      if (process.env.BRIDGE_AUTO_DENY_PERMISSIONS === '1') {
+        // Permission setup is opt-in because Browser.setPermission can wedge page CDP sockets.
+        setTimeout(() => {
+          autoDenyPermissions().catch(() => {});
+        }, 0);
+      }
+
+      if (process.env.BRIDGE_LEGACY_BLOCKING_PERMISSION_DENY === '1') {
+      // Legacy blocking permission path kept only for targeted debugging.
+      try {
+        const perms = ['geolocation','notifications','midi','midi-sysex','clipboard-read',
+          'clipboard-write','camera','microphone','background-sync','ambient-light-sensor',
+          'accelerometer','gyroscope','magnetometer','accessibility-events','payment-handler',
+          'idle-detection','storage-access','window-management'];
+        for (const name of perms) {
+          try {
+            await cdpSend('Browser.setPermission', {
+              permission: { name },
+              setting: 'denied',
+            });
+          } catch {} // some permissions may not be supported — ignore
+        }
+        console.log('[Empir3 Bridge] Auto-denied all permission prompts');
+      } catch {}
+      }
+
+      // --fresh from launcher: wipe cookies + localStorage + IndexedDB across
+      // ALL origins. Runs once per Chrome launch (not per CDP reconnect — see
+      // freshConsumed below). Preserves the profile dir / extensions / settings.
+      if (process.env.EMPIR3_BRIDGE_FRESH === '1' && !freshConsumed) {
+        await wipeAllStorage();
+        freshConsumed = true;
+      }
+
+      done();
+    });
+
+    ws.on('message', (data: Buffer) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.id && cdpCallbacks.has(msg.id)) {
+          const cb = cdpCallbacks.get(msg.id)!;
+          cdpCallbacks.delete(msg.id);
+          if (msg.error) {
+            cb.reject(new Error(msg.error.message));
+          } else {
+            lastCdpLivenessAt = Date.now();
+            cb.resolve(msg.result);
+          }
+        }
+      } catch {}
+    });
+
+    ws.on('close', () => {
+      if (cdpWs === ws) {
+        connected = false;
+        cdpWs = null;
+        lastCdpLivenessAt = 0;
+      }
+    });
+
+    ws.on('error', (e) => {
+      fail(e);
+    });
+  });
+}
+
+async function switchToTarget(targetId: string): Promise<void> {
+  const res = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+  const target = res.find((t: any) => t.id === targetId);
+  if (!target) throw new Error(`Target ${targetId} not found`);
+
+  currentTargetId = targetId;
+  connected = true;
+  lastCdpLivenessAt = Date.now();
+  try { await cdpSend('Page.enable', {}, 2000); } catch {}
+  try { await cdpSend('Page.bringToFront', {}, 2000); } catch {}
+  console.log(`[Empir3 Bridge] Switched to target: ${target.url}`);
+}
+
+function markCdpDisconnected(reason: string) {
+  if (connected || cdpWs) {
+    console.warn(`[Empir3 Bridge] CDP connection reset: ${reason}`);
+  }
+  connected = false;
+  lastCdpLivenessAt = 0;
+  if (cdpWs) {
+    try { cdpWs.close(); } catch {}
+  }
+  cdpWs = null;
+  const err = new Error(`CDP connection reset: ${reason}`);
+  for (const [, cb] of cdpCallbacks) {
+    try { cb.reject(err); } catch {}
+  }
+  cdpCallbacks.clear();
+}
+
+async function closePrimaryCdpForDirectCommand(): Promise<void> {
+  const ws = cdpWs;
+  if (!ws) return;
+  cdpWs = null;
+  connected = false;
+  const state = ws.readyState;
+  if (state === WebSocket.CLOSED || state === WebSocket.CLOSING) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    ws.once('close', finish);
+    ws.once('error', finish);
+    try { ws.close(); } catch { finish(); }
+    setTimeout(finish, 250);
+  });
+}
+
+function withCdpCommandLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = cdpCommandQueue.then(fn, fn);
+  cdpCommandQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+function cdpSendRaw(method: string, params: any = {}, timeoutMs = NAV_TIMEOUT, resetOnTimeout = true): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!cdpWs || cdpWs.readyState !== WebSocket.OPEN) {
+      return reject(new Error('CDP not connected'));
+    }
+    const ws = cdpWs;
+    const id = cdpId++;
+    cdpCallbacks.set(id, { resolve, reject, ws });
+    ws.send(JSON.stringify({ id, method, params }));
+    setTimeout(() => {
+      if (cdpCallbacks.has(id)) {
+        cdpCallbacks.delete(id);
+        if (resetOnTimeout && cdpWs === ws) markCdpDisconnected(`timeout waiting for ${method}`);
+        reject(new Error(`CDP timeout: ${method}`));
+      }
+    }, timeoutMs);
+  });
+}
+
+async function sendDirectCdpCommand(method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  const target = await currentPageTarget();
+  await closePrimaryCdpForDirectCommand();
+  const result = await cdpSendViaDirectWs(target.webSocketDebuggerUrl, method, params, timeoutMs);
+  connected = true;
+  lastCdpLivenessAt = Date.now();
+  currentTargetId = target.id;
+  return result;
+}
+
+async function sendDetachedCdpCommand(method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  const target = await currentPageTarget();
+  // Emulation overrides belong to a CDP session. A fresh session can read the
+  // host DPR and capture different pixels from the mobile page the agent sees.
+  if (emulationSession?.targetId === target.id) return emulationSession.send(method, params, timeoutMs);
+  const result = await cdpSendViaDirectWs(target.webSocketDebuggerUrl, method, params, timeoutMs);
+  connected = true;
+  lastCdpLivenessAt = Date.now();
+  currentTargetId = target.id;
+  return result;
+}
+
+async function ensureBrowserWsReady(timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + Math.max(500, timeoutMs);
+  while (Date.now() < deadline) {
+    if (browserWs && browserWs.readyState === WebSocket.OPEN) return;
+    await connectBrowserWs().catch(() => {});
+    if (browserWs && browserWs.readyState === WebSocket.OPEN) return;
+    await sleep(100);
+  }
+  throw new Error('Browser WS not connected');
+}
+
+function isBrowserDomainMethod(method: string): boolean {
+  return method.startsWith('Browser.') || method.startsWith('Target.');
+}
+
+async function sendCdpCommandViaBrowserSession(method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  await ensureBrowserWsReady(timeoutMs);
+
+  if (isBrowserDomainMethod(method)) {
+    const result = await browserSend(method, params, timeoutMs);
+    connected = true;
+    lastCdpLivenessAt = Date.now();
+    return result;
+  }
+
+  const target = await currentPageTarget();
+  currentTargetId = target.id;
+  const attachResult = await browserSend('Target.attachToTarget', { targetId: target.id, flatten: true }, timeoutMs);
+  const sessionId = attachResult?.sessionId;
+  if (!sessionId) throw new Error('No sessionId from attachToTarget');
+
+  try {
+    const result = await browserSendWithSession(sessionId, method, params, timeoutMs);
+    connected = true;
+    lastCdpLivenessAt = Date.now();
+    return result;
+  } finally {
+    try { await browserSend('Target.detachFromTarget', { sessionId }, 1500); } catch {}
+  }
+}
+
+async function verifyCdpConnection(): Promise<boolean> {
+  if (!connected || !cdpWs || cdpWs.readyState !== WebSocket.OPEN) return false;
+  if (Date.now() - lastCdpLivenessAt < CDP_LIVENESS_MAX_AGE_MS) return true;
+  try {
+    await cdpSendRaw('Runtime.evaluate', {
+      expression: '1',
+      returnByValue: true,
+    }, CDP_LIVENESS_TIMEOUT_MS, true);
+    lastCdpLivenessAt = Date.now();
+    return true;
+  } catch (e: any) {
+    console.warn(`[Empir3 Bridge] CDP liveness check failed: ${e?.message || e}`);
+    return false;
+  }
+}
+
+async function currentPageTarget(timeoutMs = 3000): Promise<any> {
+  const targets = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`, 'GET', timeoutMs);
+  let target = targets.find((t: any) => t.type === 'page' && t.id === currentTargetId);
+  if (!target) {
+    target = await pickInitialTarget();
+    currentTargetId = target.id;
+  }
+  return target;
+}
+
+async function hasReachablePageTarget(timeoutMs = 3000): Promise<boolean> {
+  try {
+    const target = await currentPageTarget(timeoutMs);
+    if (!target?.webSocketDebuggerUrl) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cdpSendViaDirectWs(wsUrl: string, method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    const id = cdpId++;
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (err?: Error, result?: any) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+      } catch {}
+      if (err) reject(err);
+      else resolve(result);
+    };
+    timer = setTimeout(() => {
+      try { (ws as any).terminate?.(); } catch {}
+      finish(new Error(`CDP direct timeout: ${method}`));
+    }, timeoutMs);
+
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ id, method, params }));
+    });
+
+    ws.on('message', (data: Buffer) => {
+      if (settled) return;
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.id !== id) return;
+        if (msg.error) finish(new Error(msg.error.message));
+        else {
+          lastCdpLivenessAt = Date.now();
+          finish(undefined, msg.result);
+        }
+      } catch (e: any) {
+        finish(e);
+      }
+    });
+
+    ws.on('error', (e) => {
+      finish(e instanceof Error ? e : new Error(String(e)));
+    });
+
+    ws.on('close', () => {
+      finish(new Error(`CDP direct connection closed: ${method}`));
+    });
+  });
+}
+
+async function cdpSend(method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  return withCdpCommandLock(async () => {
+    try {
+      return await sendDetachedCdpCommand(method, params, timeoutMs);
+    } catch (e: any) {
+      if (!shouldRetryCdpCommand(method, e)) throw e;
+
+      await connectCDP().catch(() => {});
+      return sendDetachedCdpCommand(method, params, timeoutMs);
+    }
+  });
+}
+
+async function cdpSendNoReset(method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  return withCdpCommandLock(() => sendDetachedCdpCommand(method, params, timeoutMs));
+}
+
+async function captureScreenshot(params: any): Promise<any> {
+  return withCdpCommandLock(async () => {
+    try { await sendDetachedCdpCommand('Page.enable', {}, 2000); } catch {}
+    try {
+      return await sendDetachedCdpCommand('Page.captureScreenshot', params, Math.max(CDP_COMMAND_TIMEOUT_MS, 15000));
+    } catch (e: any) {
+      if (!shouldRetryScreenshotCdpFailure(e)) throw e;
+      await connectCDP().catch(() => {});
+      try { await sendDetachedCdpCommand('Page.enable', {}, 2000); } catch {}
+      return sendDetachedCdpCommand('Page.captureScreenshot', params, Math.max(CDP_COMMAND_TIMEOUT_MS, 15000));
+    }
+  });
+}
+
+async function autoDenyPermissions(): Promise<void> {
+  const perms = ['geolocation','notifications','midi','midi-sysex','clipboard-read',
+    'clipboard-write','camera','microphone','background-sync','ambient-light-sensor',
+    'accelerometer','gyroscope','magnetometer','accessibility-events','payment-handler',
+    'idle-detection','storage-access','window-management'];
+  let denied = 0;
+  for (const name of perms) {
+    try {
+      await cdpSendRaw('Browser.setPermission', {
+        permission: { name },
+        setting: 'denied',
+      }, CDP_PERMISSION_TIMEOUT_MS, false);
+      denied++;
+    } catch {}
+  }
+  if (denied > 0) {
+    console.log(`[Empir3 Bridge] Auto-denied ${denied}/${perms.length} permission prompts`);
+  } else {
+    console.log('[Empir3 Bridge] Permission auto-deny skipped (Chrome did not acknowledge Browser.setPermission)');
+  }
+}
+
+// ─── --fresh: wipe site data ─────────────────────────────────
+
+/**
+ * Clear cookies, localStorage, IndexedDB, service workers, and cache for
+ * every origin that has stored data in this profile. Called once per Chrome
+ * launch when EMPIR3_BRIDGE_FRESH=1 (set by `npm start -- --fresh`).
+ *
+ * Strategy:
+ *   1. Network.clearBrowserCookies     — wipes cookies for all origins
+ *   2. Network.clearBrowserCache       — wipes the HTTP cache
+ *   3. Storage.clearDataForOrigin('*') with all data types — covers
+ *      localStorage, IndexedDB, service workers, cache storage, etc.
+ *
+ * Extensions, settings, history, autofill, and the profile dir itself are
+ * preserved — only site-data is wiped. This matches the user-visible
+ * meaning of "fresh user state".
+ */
+async function wipeAllStorage(): Promise<void> {
+  console.log('[Empir3 Bridge] --fresh: clearing cookies + localStorage + IndexedDB...');
+  const dataTypes = [
+    'cookies',
+    'local_storage',
+    'indexeddb',
+    'service_workers',
+    'cache_storage',
+    'websql',
+    'file_systems',
+    'shader_cache',
+  ].join(',');
+
+  let cleared = 0;
+  try {
+    await cdpSend('Network.clearBrowserCookies', {});
+    cleared++;
+  } catch (e: any) {
+    console.log(`[Empir3 Bridge]   clearBrowserCookies failed: ${e.message}`);
+  }
+  try {
+    await cdpSend('Network.clearBrowserCache', {});
+    cleared++;
+  } catch (e: any) {
+    console.log(`[Empir3 Bridge]   clearBrowserCache failed: ${e.message}`);
+  }
+  // CDP requires a real origin URL — '*' isn't a wildcard. Pass an empty
+  // origin so Chrome treats it as a profile-wide clear when supported,
+  // and ALSO walk the storage list to catch every origin explicitly.
+  try {
+    await cdpSend('Storage.clearDataForOrigin', { origin: '*', storageTypes: dataTypes });
+    cleared++;
+  } catch {
+    // 'all' wildcard isn't supported on every Chrome build — fall through to
+    // the per-origin loop below.
+  }
+  try {
+    const usage = await cdpSend('Storage.getUsageAndQuota', { origin: 'about:blank' });
+    // Some Chrome builds expose origins via Storage.trackIndexedDBForOrigin
+    // notifications, but the cheap path is enumerating navigation history.
+    // Skip if usage call failed — clearDataForOrigin('*') already did the job.
+    void usage;
+  } catch {}
+  console.log(`[Empir3 Bridge] --fresh: ${cleared}/3 wipe steps succeeded`);
+}
+
+// ─── CDP Helpers ─────────────────────────────────────────────
+
+async function cdpEvaluate(expression: string, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  browserDialogs.check(currentTargetId);
+  const result = await cdpSend('Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+  }, timeoutMs);
+  if (result.exceptionDetails) {
+    // CDP's exceptionDetails.text is usually just "Uncaught" — useless on its own.
+    // The actual error message + stack lives in exception.description.
+    // Trim trailing newlines and cap at 500 chars so error fits in one line.
+    const ex = result.exceptionDetails;
+    const desc = (ex.exception && ex.exception.description) || ex.text || 'JS evaluation error';
+    const trimmed = String(desc).split('\n')[0].slice(0, 500);
+    throw new Error(trimmed);
+  }
+  return result.result?.value;
+}
+
+async function cdpNavigate(url: string): Promise<void> {
+  try {
+    await cdpSend('Page.navigate', { url }, Math.min(CDP_COMMAND_TIMEOUT_MS, 5000));
+  } catch (e: any) {
+    if (!(await waitForTargetUrl(url, 5000))) throw e;
+  }
+  // Chrome target metadata normally updates before page-level Runtime.evaluate
+  // is ready. That is enough for browser_control.open; text/snapshot can read
+  // the page afterward without making open wait on a slow eval loop.
+  await waitForTargetUrl(url, 8000);
+  try { await cdpSend('Page.enable'); } catch {}
+  try { await cdpEvaluate('document.readyState', 1200); } catch {}
+}
+
+async function waitForTargetUrl(expectedUrl: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const normalizeUrl = (u: string) => u.replace(/[#/]+$/, '');
+  while (Date.now() < deadline) {
+    try {
+      const targets = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+      const target = targets.find((t: any) => t.type === 'page' && t.id === currentTargetId)
+        || targets.find((t: any) => t.type === 'page' && normalizeUrl(String(t.url || '')) === normalizeUrl(expectedUrl));
+      if (target && normalizeUrl(String(target.url || '')) === normalizeUrl(expectedUrl)) {
+        currentTargetId = target.id;
+        return true;
+      }
+    } catch {}
+    await sleep(250);
+  }
+  return false;
+}
+
+// ─── Per-Target Evaluation (for injecting into non-active tabs) ──
+
+/**
+ * Evaluate JS on a specific target by opening a temporary CDP WS connection.
+ * Does NOT switch the active target — the main cdpWs stays on currentTargetId.
+ */
+async function evaluateOnTarget(targetId: string, expression: string, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  if (emulationSession?.targetId === targetId) {
+    const result = await withCdpCommandLock(() => emulationSession!.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, timeoutMs));
+    if (result?.exceptionDetails) throw new Error(String(result.exceptionDetails.exception?.description || result.exceptionDetails.text).split('\n')[0]);
+    return result?.result?.value;
+  }
+  // If it's the current target, just use the existing connection
+  if (targetId === currentTargetId && cdpWs) {
+    return cdpEvaluate(expression, timeoutMs);
+  }
+
+  // Try direct WS via HTTP /json endpoint (works for bridge-known targets)
+  let directUrl: string | undefined;
+  try {
+    const targets = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+    directUrl = targets.find((t: any) => t.id === targetId && t.type === 'page')?.webSocketDebuggerUrl;
+  } catch {}
+  // Once evaluation starts, never retry its possibly mutating expression.
+  if (directUrl) return evaluateViaDirectWs(directUrl, expression, timeoutMs);
+
+  // Fallback: use browser WS with Target.attachToTarget (for user-opened tabs not in /json)
+  if (browserWs && browserWs.readyState === WebSocket.OPEN) {
+    return await evaluateViaBrowserSession(targetId, expression, timeoutMs);
+  }
+
+  throw new Error(`Target ${targetId} not reachable via /json or browser WS`);
+}
+
+/** Evaluate via a temporary direct WS connection to a target */
+function evaluateViaDirectWs(wsUrl: string, expression: string, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  return withCdpCommandLock(() => new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (err?: Error, result?: any) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+      } catch {}
+      if (err) reject(err);
+      else resolve(result);
+    };
+    timer = setTimeout(() => {
+      try { (ws as any).terminate?.(); } catch {}
+      finish(new Error('evaluate-on-target timeout'));
+    }, timeoutMs);
+
+    ws.on('open', () => {
+      const id = cdpId++;
+      ws.send(JSON.stringify({
+        id,
+        method: 'Runtime.evaluate',
+        params: { expression, returnByValue: true, awaitPromise: true },
+      }));
+      ws.on('message', (data: Buffer) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.id === id) {
+            if (msg.error) finish(new Error(msg.error.message));
+            else if(msg.result?.exceptionDetails) finish(new Error(String(msg.result.exceptionDetails.exception?.description || msg.result.exceptionDetails.text).split('\n')[0]));
+            else finish(undefined, msg.result?.result?.value);
+          }
+        } catch (e: any) {
+          finish(e);
+        }
+      });
+    });
+
+    ws.on('error', (e) => finish(e instanceof Error ? e : new Error(String(e))));
+    ws.on('close', () => finish(new Error('evaluate-on-target connection closed')));
+  }));
+}
+
+/** Evaluate via browser WS using Target.attachToTarget flat session */
+async function evaluateViaBrowserSession(targetId: string, expression: string, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+  if (!browserWs || browserWs.readyState !== WebSocket.OPEN) {
+    throw new Error('Browser WS not connected');
+  }
+
+  // Attach to target to get a session
+  const attachResult = await browserSend('Target.attachToTarget', { targetId, flatten: true }, timeoutMs);
+  const sessionId = attachResult?.sessionId;
+  if (!sessionId) throw new Error('No sessionId from attachToTarget');
+
+  try {
+    // Evaluate via the flat session
+    const evalResult = await browserSendWithSession(sessionId, 'Runtime.evaluate', {
+      expression, returnByValue: true, awaitPromise: true,
+    }, timeoutMs);
+
+    if(evalResult?.exceptionDetails)throw new Error(String(evalResult.exceptionDetails.exception?.description || evalResult.exceptionDetails.text).split('\n')[0]);
+    return evalResult?.result?.value;
+  } finally {
+    // Detach to clean up
+    try {
+      await browserSend('Target.detachFromTarget', { sessionId }, 1500);
+    } catch {}
+  }
+}
+
+/** Send a command on the browser WS (no session) */
+function browserSend(method: string, params: any = {}, timeoutMs = 10000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!browserWs || browserWs.readyState !== WebSocket.OPEN) {
+      return reject(new Error('Browser WS not connected'));
+    }
+    const id = browserCdpId++;
+    browserCallbacks.set(id, { resolve, reject });
+    browserWs.send(JSON.stringify({ id, method, params }));
+    setTimeout(() => {
+      if (browserCallbacks.has(id)) {
+        browserCallbacks.delete(id);
+        reject(new Error(`Browser WS timeout: ${method}`));
+      }
+    }, timeoutMs);
+  });
+}
+
+/** Send a command on the browser WS with a flat-session sessionId */
+function browserSendWithSession(sessionId: string, method: string, params: any = {}, timeoutMs = 10000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!browserWs || browserWs.readyState !== WebSocket.OPEN) {
+      return reject(new Error('Browser WS not connected'));
+    }
+    const id = browserCdpId++;
+    browserCallbacks.set(id, { resolve, reject });
+    browserWs.send(JSON.stringify({ id, sessionId, method, params }));
+    setTimeout(() => {
+      if (browserCallbacks.has(id)) {
+        browserCallbacks.delete(id);
+        reject(new Error(`Browser session timeout: ${method}`));
+      }
+    }, timeoutMs);
+  });
+}
+
+/**
+ * Evaluate JS on ALL known page targets. Returns array of {targetId, url, ok, result/error}.
+ */
+async function evaluateOnAllTargets(expression: string, timeoutMs = CDP_COMMAND_TIMEOUT_MS): Promise<any[]> {
+  const targets = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+  const pages = targets.filter((t: any) => t.type === 'page');
+  const results: any[] = [];
+
+  for (const page of pages) {
+    try {
+      const result = await evaluateOnTarget(page.id, expression, timeoutMs);
+      results.push({ targetId: page.id, url: page.url, ok: true, result });
+    } catch (e: any) {
+      results.push({ targetId: page.id, url: page.url, ok: false, error: e.message });
+    }
+  }
+  return results;
+}
+
+// ─── Target Discovery — poll for new tabs and auto-inject ────
+
+// Auto-inject must not hold the single global CDP command lock for the full 10s
+// default — a stalled eval against a heavy page (e.g. the bridge's own welcome
+// console) would block every other CDP op and starve the shared event loop, so
+// trivial HTTP handlers (/api/status, /api/relay-status) queue for seconds and the
+// tray's liveness poll times out. Cap it short so a stuck inject releases the lock fast.
+const AUTO_INJECT_TIMEOUT_MS = 2000;
+let pollInFlight = false;
+async function pollTargets() {
+  // Never overlap: a single auto-inject can await up to AUTO_INJECT_TIMEOUT_MS, which
+  // is longer than the 500ms poll interval. Without this guard, successive ticks pile
+  // concurrent fresh-WS Runtime.evaluate calls onto the loop — the saturation storm.
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const targets = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+    const pages = targets.filter((t: any) => t.type === 'page');
+    if (pages.length === 0) {
+      // Don't latch closed on a single empty poll — route through the debounced
+      // confirmation, which re-polls /json a few times before concluding the user
+      // closed the browser. Prevents the transient-empty post-refresh flap.
+      markClosedIfNoPageTargets('no page targets in poll').catch(() => {});
+      return;
+    }
+
+    for (const page of pages) {
+      const prevUrl = knownTargets.get(page.id);
+      const isNew = prevUrl === undefined;
+      const urlChanged = prevUrl !== undefined && prevUrl !== page.url;
+
+      // Skip chrome:// and about: pages — can't inject JS into them.
+      // Don't mark them as known so we re-check when they navigate to a real URL.
+      if (page.url.startsWith('chrome://') || page.url.startsWith('about:') || page.url.startsWith('devtools://')) {
+        continue;
+      }
+
+      if (isNew || urlChanged) {
+        knownTargets.set(page.id, page.url);
+        if (isNew) {
+          console.log(`[Empir3 Bridge] New tab detected: ${page.url} (${page.id})`);
+        } else {
+          console.log(`[Empir3 Bridge] Tab navigated: ${prevUrl} → ${page.url} (${page.id})`);
+        }
+
+        // Auto-inject registered script (short timeout — see AUTO_INJECT_TIMEOUT_MS).
+        if (autoInjectScript) {
+          try {
+            await evaluateOnTarget(page.id, autoInjectScript, AUTO_INJECT_TIMEOUT_MS);
+            console.log(`[Empir3 Bridge] Auto-injected into: ${page.url}`);
+          } catch (e: any) {
+            console.log(`[Empir3 Bridge] Auto-inject failed for ${page.url}: ${e.message?.slice(0, 60)}`);
+          }
+        }
+      }
+    }
+
+    // Prune destroyed targets
+    const currentIds = new Set(pages.map((p: any) => p.id));
+    for (const id of knownTargets.keys()) {
+      if (!currentIds.has(id)) {
+        knownTargets.delete(id);
+      }
+    }
+  } catch {
+    // Bridge may be busy or Chrome not ready
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+function startTargetPolling() {
+  if (targetPollTimer) return;
+  // Seed known targets
+  pollTargets();
+  // Poll every 500ms for new tabs — fast enough to inject overlay before user interacts
+  targetPollTimer = setInterval(pollTargets, 500);
+  console.log('[Empir3 Bridge] Target polling started (500ms interval)');
+}
+
+function stopTargetPolling() {
+  if (targetPollTimer) {
+    clearInterval(targetPollTimer);
+    targetPollTimer = null;
+  }
+}
+
+// ─── Browser-Level Target Discovery ─────────────────────────
+// Connects to Chrome's browser WS to receive Target.targetCreated events
+// for ALL tabs — including ones the user opens manually.
+
+async function connectBrowserWs(): Promise<void> {
+  if (browserWs && browserWs.readyState === WebSocket.OPEN) return;
+  if (browserWsConnecting) return;
+  browserWsConnecting = true;
+  try {
+    const versionInfo = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json/version`);
+    const wsUrl = versionInfo.webSocketDebuggerUrl;
+    if (!wsUrl) {
+      console.log('[Empir3 Bridge] No browser WS URL available');
+      browserWsConnecting = false;
+      return;
+    }
+
+    return new Promise((resolve) => {
+      const ws = new WebSocket(wsUrl);
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        browserWsConnecting = false;
+        resolve();
+      };
+
+      ws.on('open', () => {
+        browserWs = ws;
+        if (browserReconnectTimer) {
+          clearTimeout(browserReconnectTimer);
+          browserReconnectTimer = null;
+        }
+        console.log('[Empir3 Bridge] Browser-level WS connected');
+        // Subscribe to all target events
+        const id = browserCdpId++;
+        ws.send(JSON.stringify({ id, method: 'Target.setDiscoverTargets', params: { discover: true } }));
+        finish();
+      });
+
+      ws.on('message', (data: Buffer) => {
+        try {
+          const msg = JSON.parse(data.toString());
+
+          // Handle responses to our commands
+          if (msg.id && browserCallbacks.has(msg.id)) {
+            const cb = browserCallbacks.get(msg.id)!;
+            browserCallbacks.delete(msg.id);
+            if (msg.error) cb.reject(new Error(msg.error.message));
+            else cb.resolve(msg.result);
+          }
+
+          // Handle target events
+          if (msg.method === 'Target.targetCreated') {
+            const info = msg.params?.targetInfo;
+            if (info?.type === 'page') {
+              handleNewTarget(info.targetId, info.url);
+            }
+          }
+
+          if (msg.method === 'Target.targetInfoChanged') {
+            const info = msg.params?.targetInfo;
+            if (info?.type === 'page') {
+              handleTargetUrlChange(info.targetId, info.url);
+            }
+          }
+
+          if (msg.method === 'Target.targetDestroyed') {
+            knownTargets.delete(msg.params?.targetId);
+            tabBadges.delete(msg.params?.targetId);
+            markClosedIfNoPageTargets('last page target destroyed').catch(() => {});
+          }
+        } catch {}
+      });
+
+      ws.on('close', () => {
+        if (browserWs === ws) {
+          browserWs = null;
+          if (!chromeProcess || chromeClosedByUser || shuttingDown) {
+            console.log('[Empir3 Bridge] Browser WS disconnected');
+          } else if (!browserReconnectTimer) {
+            console.log('[Empir3 Bridge] Browser WS disconnected - reconnecting in 3s');
+            browserReconnectTimer = setTimeout(() => {
+              browserReconnectTimer = null;
+              connectBrowserWs().catch(() => {});
+            }, 3000);
+          }
+        }
+        finish();
+      });
+
+      ws.on('error', () => {
+        if (browserWs === ws) browserWs = null;
+        finish(); // don't block startup
+      });
+
+      setTimeout(finish, 5000); // timeout fallback
+    });
+  } catch (e: any) {
+    browserWsConnecting = false;
+    console.log(`[Empir3 Bridge] Browser WS connect failed: ${e.message?.slice(0, 60)}`);
+  }
+}
+
+function handleNewTarget(targetId: string, url: string) {
+  // Skip chrome:// and internal pages
+  if (url.startsWith('chrome://') || url.startsWith('about:') || url.startsWith('devtools://')) return;
+
+  if (!knownTargets.has(targetId)) {
+    knownTargets.set(targetId, url);
+    console.log(`[Empir3 Bridge] [Browser WS] New tab: ${url} (${targetId.slice(0, 8)})`);
+    autoInjectIntoTarget(targetId, url);
+    scheduleBadgeRestamp(targetId);
+  }
+}
+
+function handleTargetUrlChange(targetId: string, url: string) {
+  if (url.startsWith('chrome://') || url.startsWith('about:') || url.startsWith('devtools://')) return;
+
+  const prevUrl = knownTargets.get(targetId);
+  if (prevUrl !== url) {
+    knownTargets.set(targetId, url);
+    console.log(`[Empir3 Bridge] [Browser WS] Tab navigated: ${(prevUrl || '(new)').slice(0, 40)} → ${url.slice(0, 40)}`);
+    autoInjectIntoTarget(targetId, url);
+    scheduleBadgeRestamp(targetId);
+  }
+}
+
+/** Navigations reset document.title; stamp again once the page has settled.
+ *  Two attempts (mirrors autoInjectIntoTarget's delay/retry rhythm). */
+function scheduleBadgeRestamp(targetId: string) {
+  if (!tabBadges.has(targetId)) return;
+  setTimeout(() => { stampTabBadge(targetId).catch(() => {}); }, 700);
+  setTimeout(() => { stampTabBadge(targetId).catch(() => {}); }, 2500);
+}
+
+async function autoInjectIntoTarget(targetId: string, url: string) {
+  if (!autoInjectScript) return;
+  // Small delay — page may still be loading
+  await sleep(300);
+  try {
+    await evaluateOnTarget(targetId, autoInjectScript);
+    console.log(`[Empir3 Bridge] Auto-injected into: ${url.slice(0, 50)}`);
+  } catch (e: any) {
+    // Retry once after a longer delay (page might not be ready)
+    await sleep(1000);
+    try {
+      await evaluateOnTarget(targetId, autoInjectScript);
+      console.log(`[Empir3 Bridge] Auto-injected into (retry): ${url.slice(0, 50)}`);
+    } catch {
+      console.log(`[Empir3 Bridge] Auto-inject failed for ${url.slice(0, 40)}: ${e.message?.slice(0, 40)}`);
+    }
+  }
+}
+
+async function cdpScreenshot(maxWidth?: number): Promise<Buffer> {
+  const params: any = { format: 'jpeg', quality: 80 };
+  // If maxWidth specified, cap output image dimensions (accounting for devicePixelRatio)
+  if (maxWidth && maxWidth > 0) {
+    try {
+      const evalResult = await cdpSend('Runtime.evaluate', {
+        expression: 'JSON.stringify({w:window.innerWidth,h:window.innerHeight,dpr:window.devicePixelRatio||1,sx:window.scrollX||0,sy:window.scrollY||0})',
+        returnByValue: true,
+      });
+      const vp = JSON.parse(evalResult.result.value);
+      if (vp.w > 0 && vp.h > 0 && vp.dpr > 0) {
+        const physicalWidth = vp.w * vp.dpr;
+        if (physicalWidth > maxWidth) {
+          const scale = Math.max(0.1, Math.min(2.0, maxWidth / physicalWidth));
+          params.clip = viewportClip(vp, scale);
+        }
+      }
+    } catch {}
+  }
+  const result = await captureScreenshot(params);
+  return Buffer.from(result.data, 'base64');
+}
+
+
+async function getAccessibilityTree(filter: string = 'interactive'): Promise<any[]> {
+  // Use DOM + accessibility API to build element refs
+  // Allocate before awaiting CDP so concurrent captures cannot reuse refs.
+  const snapshotId = ++snapshotSequence;
+
+  const jsCode = `(function() {
+    const results = [];
+    if (!document.body) return JSON.stringify({error:'The page changed while taking its snapshot. Wait and observe again.',code:'page_loading'});
+    // A previously visible element may now be hidden or outside the viewport.
+    // Remove every old marker before assigning the new observation's refs.
+    document.querySelectorAll('[data-empir3-ref]').forEach(el => el.removeAttribute('data-empir3-ref'));
+    const interactiveRoles = new Set([
+      'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
+      'menuitem', 'tab', 'switch', 'slider', 'spinbutton', 'searchbox',
+      'option', 'menuitemcheckbox', 'menuitemradio', 'treeitem'
+    ]);
+    const interactiveTags = new Set([
+      'A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'DETAILS', 'SUMMARY'
+    ]);
+
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_ELEMENT,
+      null
+    );
+
+    let node = walker.currentNode;
+    let refIdx = 0;
+    const visited = new Set();
+
+    function processNode(el) {
+      if (visited.has(el)) return;
+      visited.add(el);
+
+      // Skip the bridge's own injected overlay UI (id="empir3-*" roots and
+      // everything inside them) — its chat input, toolbar, and mode buttons
+      // are "interactive" and would otherwise pollute the snapshot with refs
+      // that don't belong to the page under test.
+      if (el.closest && el.closest('[id^="empir3-"]')) return;
+
+      const role = el.getAttribute('role') || '';
+      const tag = el.tagName;
+      // Interactive-state ARIA attributes mark click targets that are otherwise
+      // plain <div>/<span> with addEventListener handlers (which can't be read
+      // from the DOM). Widening on these + contenteditable + an explicit onclick
+      // attribute catches more styled-div click targets without flooding.
+      const interactiveAttrs = ['aria-haspopup', 'aria-expanded', 'aria-pressed', 'aria-checked', 'aria-selected', 'onclick'];
+      const hasInteractiveAttr = interactiveAttrs.some(a => el.hasAttribute(a));
+      const editable = el.isContentEditable === true;
+      const isInteractive = interactiveRoles.has(role) ||
+        interactiveTags.has(tag) ||
+        el.onclick ||
+        el.hasAttribute('tabindex') ||
+        (el.hasAttribute('data-testid')) ||
+        hasInteractiveAttr ||
+        editable ||
+        (getComputedStyle(el).cursor === 'pointer' &&
+          getComputedStyle(el.parentElement || document.body).cursor !== 'pointer' &&
+          !el.parentElement?.closest('button,a,summary,[role="button"],[role="link"],[tabindex],[contenteditable="true"],[aria-haspopup],[aria-expanded],[aria-pressed],[aria-checked],[aria-selected],[onclick]'));
+
+      if (${filter === 'all' ? 'true' : 'isInteractive'}) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return;
+        if (rect.right < 0 || rect.bottom < 0 || rect.left > window.innerWidth || rect.top > window.innerHeight) return;
+        if (getComputedStyle(el).display === 'none') return;
+        if (getComputedStyle(el).visibility === 'hidden') return;
+        if (el.closest('[inert]')) return;
+        // Closed details/content-visibility can retain nonzero descendant
+        // rectangles even though the browser does not render the controls.
+        if (typeof el.checkVisibility === 'function' && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return;
+
+        const labelledBy = (el.getAttribute('aria-labelledby') || '').split(/\\s+/).filter(Boolean).map(id => document.getElementById(id)?.textContent || '').join(' ').trim();
+        const clean = text => String(text || '').replace(/\\s+/g,' ').trim();
+        const adjacent = [el.nextSibling,el.previousSibling].filter(n => n?.nodeType === 3).map(n=>clean(n.textContent)).find(Boolean) || '';
+        const name = el.getAttribute('aria-label') || labelledBy ||
+          (el.labels?.length ? Array.from(el.labels).map(label => label.textContent).join(' ').trim() : '') ||
+          el.getAttribute('title') ||
+          el.getAttribute('placeholder') ||
+          (tag==='INPUT' && /^(submit|button|reset)$/.test(el.type) ? el.value : '') ||
+          (editable ? '' : el.innerText?.slice(0, 80)?.trim()) || adjacent ||
+          clean(el.parentElement?.innerText).slice(0,80) || '';
+        // Context comes from the enclosing item, excluding editable values.
+        let item = el.closest('article,li,[role="listitem"],[data-card],.card,tr');
+        if (item?.tagName === 'TR' && !item.querySelector('h1,h2,h3,h4,[role="heading"],.titleline') && item.previousElementSibling?.querySelector('.titleline')) item=item.previousElementSibling;
+        let context = '', itemOrder, itemTotal;
+        if (item) {
+          const rank = clean(item.querySelector('.rank')?.textContent).match(/^(\\d+)\\.?$/);
+          const peers = Array.from(item.parentElement?.children || []).filter(n=>n.tagName===item.tagName && (!rank || n.querySelector('.rank')));
+          itemOrder=rank ? Number(rank[1]) : peers.indexOf(item)+1;
+          itemTotal=peers.length;
+          const copy = item.cloneNode(true);
+          copy.querySelectorAll('input,textarea,select,[contenteditable],script,style').forEach(n=>n.remove());
+          context=clean(copy.tagName==='TR' ? copy.textContent : copy.querySelector('h1,h2,h3,h4,[role="heading"],.titleline')?.textContent || copy.textContent).slice(0,60);
+        }
+        const state = attr => el.hasAttribute(attr) ? (el.getAttribute(attr)==='mixed' ? 'mixed' : el.getAttribute(attr)==='true') : undefined;
+
+        const ref = 'e${snapshotId}_' + refIdx++;
+        // Store a unique path for later retrieval
+        el.setAttribute('data-empir3-ref', ref);
+
+        results.push({
+          ref: ref,
+          role: role || ({BUTTON:'button', SELECT:'combobox', TEXTAREA:'textbox', A:'link', INPUT:el.type === 'checkbox'?'checkbox':el.type === 'radio'?'radio':/^(submit|button|reset|image)$/.test(el.type)?'button':'textbox', SUMMARY:'button'}[tag] || (editable?'textbox':tag.toLowerCase())),
+          name: name,
+          tag: tag.toLowerCase(), context, itemOrder, itemTotal,
+          checked: tag==='INPUT' && ['checkbox','radio'].includes(el.type) ? (el.indeterminate?'mixed':el.checked) : state('aria-checked'),
+          selected: tag==='OPTION' ? el.selected : state('aria-selected'),
+          disabled: el.matches(':disabled') || el.getAttribute('aria-disabled')==='true',
+          expanded: state('aria-expanded'),
+          ...(tag==='SELECT' ? {options:Array.from(el.options).map(o=>({value:o.value,label:o.label,disabled:o.disabled || o.parentElement?.disabled===true}))} : {}),
+          bounds: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          }
+        });
+      }
+    }
+
+    processNode(node);
+    while (node = walker.nextNode()) {
+      processNode(node);
+    }
+
+    const groupKey = n => n.role + ':' + (/\\bcomments?\\b/i.test(n.name) ? 'comments' : n.name.toLowerCase());
+    const counts = new Map(), orders = new Map();
+    results.forEach(n=>counts.set(groupKey(n),(counts.get(groupKey(n)) || 0)+1));
+    results.forEach(n=>{const key=groupKey(n);n.order=(orders.get(key)||0)+1;n.total=counts.get(key);orders.set(key,n.order);});
+    return JSON.stringify(results);
+  })()`;
+
+  const resultStr = await cdpEvaluate(jsCode);
+  const result=JSON.parse(resultStr || '[]');
+  if(result.error)throw browserActionFailure(result.error,result.code);
+  return result;
+}
+
+interface BrowserActionTarget {
+  x: number;
+  y: number;
+  tag: string;
+  editable: boolean;
+}
+
+async function resolveBrowserActionTarget(selector: string, label: string, requireEditable = false, desiredText?: string): Promise<BrowserActionTarget> {
+  const observedTargetId = currentTargetId;
+  const resultText = await cdpEvaluate(browserActionPointExpression(selector, label, requireEditable, desiredText, observedTargetId));
+  const result = JSON.parse(resultText || '{}');
+  if (result.error) {
+    if (result.selectOptions) {
+      const step = {action:'select',locator:{selector},value:result.selectValue ?? 'COPY_AN_OPTION_VALUE'};
+      const recipe = {action:'control_run',params:{target:{surface:'browser',tabId:observedTargetId},steps:[step]}};
+      throw browserActionFailure(`${result.error} No input was sent. Use browser_control ${JSON.stringify(recipe)}. Enabled options: ${JSON.stringify(result.selectOptions)}. Select the menu value directly; option elements are not mouse click targets.`, result.code || 'select_not_text_field');
+    }
+    throw Object.assign(new Error(result.error), {
+      actionFailure: true, code: result.code || 'element_not_actionable',
+      httpStatus: result.code === 'element_not_found' ? 404 : 409,
+      target: label, inputMayHaveOccurred: false,
+    });
+  }
+  if (!Number.isFinite(result.x) || !Number.isFinite(result.y)) throw new Error(`Element is not actionable: ${label}`);
+  return result;
+}
+
+async function clickBrowserTarget(selector: string, label: string): Promise<any> {
+  const target = await resolveBrowserActionTarget(selector, label);
+  const agentTargetId = currentTargetId;
+  await ensureBrowserWsReady();
+  const before = await browserSend('Target.getTargets');
+  const existingTargets = new Set((before?.targetInfos || []).map((t:any)=>t.targetId));
+  const token = `e3Click${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
+  const held = emulationSession?.targetId === currentTargetId ? emulationSession : null;
+  const session = held || await openPageCdpSession();
+  const events: string[] = [];
+  // Keep the proof in the Bridge process. A successful link click can destroy
+  // the document (including its event store) before the post-click readback.
+  const stop = session.onEvent(event => {
+    if (event.method === 'Runtime.bindingCalled' && event.params?.name === token && ['pointerdown','mousedown','touchstart','click'].includes(event.params.payload)) events.push(event.params.payload);
+  });
+  try {
+    await session.send('Runtime.enable');
+    await session.send('Runtime.addBinding', { name: token });
+    const armed = await session.send('Runtime.evaluate', { returnByValue: true, expression: `(function() {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return false;
+      const token = ${JSON.stringify(token)};
+      const store = window.__empir3ActionReceipts || (window.__empir3ActionReceipts = {});
+      const handler = function(event) {
+        if (event.isTrusted && (event.target === el || el.contains(event.target))) window[token](event.type);
+      };
+      const types = ['pointerdown', 'mousedown', 'touchstart', 'click'];
+      // Observe before page/framework document handlers stop propagation.
+      // The trusted event must still target this exact control or its child.
+      types.forEach(type => window.addEventListener(type, handler, true));
+      store[token] = { el, handler, types };
+      return true;
+    })()` });
+    if (armed?.result?.value !== true) throw browserActionFailure(`Element disappeared before input: ${label}`,'element_not_found');
+    await clickByXY(target.x, target.y);
+    await sleep(40);
+    if (!events.length) {
+      const error: any = new Error(`Browser dispatched a click but ${label} received no trusted pointer event that the Bridge could confirm. Input may have occurred. Observe this tab's result before retrying; do not submit the form twice.`);
+      error.actionFailure = true;
+      error.code = 'click_not_confirmed';
+      error.httpStatus = 409;
+      error.target = label;
+      error.inputMayHaveOccurred = true;
+      throw error;
+    }
+    const after = await browserSend('Target.getTargets');
+    const opened = (after?.targetInfos || []).find((t:any)=>t.type==='page' && t.openerId===agentTargetId && !existingTargets.has(t.targetId));
+    if(opened) {
+      // A popup belongs to this click, but the driving agent remains on its tab.
+      await browserSend('Target.activateTarget',{targetId:agentTargetId});
+    }
+    return { success: true, verified: true, target: label, receivedEvents: events,
+      ...(opened?{newTab:{targetId:opened.targetId,url:opened.url}}:{}) };
+  } finally {
+    stop();
+    try {
+      await session.send('Runtime.evaluate', { expression: `(function() {
+        const token = ${JSON.stringify(token)}, store = window.__empir3ActionReceipts || {}, receipt = store[token];
+        if (receipt) receipt.types.forEach(type => window.removeEventListener(type, receipt.handler, true));
+        delete store[token]; delete window[token];
+      })()` }, 1500);
+      await session.send('Runtime.removeBinding', { name: token }, 1500);
+    } catch { /* the document or tab closed during a successful click */ }
+    if (!held) session.close();
+  }
+}
+
+async function clickByRef(ref: string): Promise<any> {
+  return clickBrowserTarget(`[data-empir3-ref=${JSON.stringify(ref)}]`, `ref:${ref}`);
+}
+
+async function typeIntoBrowserTarget(selector: string, label: string, text: string): Promise<any> {
+  const target = await resolveBrowserActionTarget(selector, label, true, text);
+  const token = `e3-type-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // Keep the exact DOM node through focus/input-driven layout changes. A CSS
+  // path can move when a suggestion popup inserts a sibling, or identify a
+  // replacement control that must never receive restoration of the old value.
+  const retainedElement = `(window.__empir3ActionReceipts || {})[${JSON.stringify(token)}]?.el`;
+  // Chromium represents blank editable lines as <div><br></div>. innerText
+  // counts the placeholder BR as another newline; textContent drops all line
+  // boundaries. Read those editing fragments without the caret placeholders.
+  const editableText = `(function read(node) {
+    const children = Array.from(node.childNodes);
+    const block = child => child.nodeType === 1 && /^(DIV|P|LI|H[1-6])$/.test(child.nodeName);
+    let value = '';
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i];
+      if (child.nodeType === 3) { value += child.textContent || ''; continue; }
+      if (child.nodeType !== 1) continue;
+      if (child.nodeName === 'BR') {
+        if (children.length !== 1 && !block(children[i + 1] || {})) value += '\\n';
+        continue;
+      }
+      if (i > 0 && (block(child) || block(children[i - 1]))) value += '\\n';
+      value += read(child);
+    }
+    return value;
+  })(el)`;
+  const originalText = await cdpEvaluate(`(function() {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) return JSON.stringify({ error: 'not_found' });
+    const value = el.isContentEditable ? ${editableText} : String(el.value ?? '');
+    const store = window.__empir3ActionReceipts || (window.__empir3ActionReceipts = {});
+    const r=el.getBoundingClientRect();
+    store[${JSON.stringify(token)}] = { el, box:{left:r.left,top:r.top,right:r.right,bottom:r.bottom,width:r.width,height:r.height} };
+    return JSON.stringify({ value, html: el.isContentEditable ? el.innerHTML : undefined });
+  })()`);
+  const original = JSON.parse(originalText || '{}');
+  if (original.error) throw browserActionFailure(`Element disappeared before typing: ${label}`,'element_not_found');
+
+  try {
+    await clickBrowserTarget(selector, label);
+    const focusText = await cdpEvaluate(retargetEditableExpression(token));
+    if (focusText !== 'true') throw browserActionFailure(`Click did not focus editable element: ${label}`, 'focus_not_confirmed', true);
+    await pressKey('Control+a');
+    await pressKey('Backspace');
+    // Selection/deletion can trigger a framework rerender or move focus. Never
+    // insert into a different field; an in-place editable replacement is safe.
+    const insertionFocus = await cdpEvaluate(retargetEditableExpression(token));
+    if (insertionFocus !== 'true') throw browserActionFailure(`Element disappeared or lost focus before typing: ${label}`, 'focus_not_confirmed', true);
+    // Chromium generates trusted editing/input events for the whole value.
+    // Filling a field must not pay two CDP round trips and a delay per character.
+    if (text) await cdpSend('Input.insertText', { text });
+    await sleep(50);
+    const valueText = await cdpEvaluate(`(function() {
+      const el = ${retainedElement};
+      if (!el?.isConnected) return JSON.stringify({ error: 'detached' });
+      const value = el.isContentEditable ? ${editableText} : String(el.value ?? '');
+      return JSON.stringify({ value });
+    })()`);
+    const observed = JSON.parse(valueText || '{}');
+    if (observed.error) throw browserActionFailure(`Element disappeared while typing: ${label}`, 'typing_not_confirmed', true);
+    if (observed.value !== text) {
+      throw browserActionFailure(`Typing verification failed for ${label}: expected ${text.length} characters, observed ${String(observed.value || '').length}`, 'typing_not_confirmed', true);
+    }
+  } catch (error) {
+    // A failed verified type must not leave the user's form dirtier than we
+    // found it. Use the native value setter so React-controlled inputs see
+    // the restoration too, then notify ordinary input/change listeners.
+    try {
+      await cdpEvaluate(`(function() {
+        const el = ${retainedElement};
+        if (!el?.isConnected) return false;
+        const originalValue = ${JSON.stringify(String(original.value ?? ''))};
+        if (el.isContentEditable) {
+          el.innerHTML = ${JSON.stringify(String(original.html ?? ''))};
+        } else {
+          const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(el, originalValue);
+          else el.value = originalValue;
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      })()`);
+    } catch { /* preserve the original verified failure */ }
+    throw error;
+  } finally {
+    await cdpEvaluate(`delete (window.__empir3ActionReceipts || {})[${JSON.stringify(token)}]`)
+      .catch(() => { /* navigation may already have discarded the document */ });
+  }
+  return { success: true, verified: true, target: label, characters: text.length, tag: target.tag };
+}
+
+// ── Mobile device emulation ────────────────────────────────────────────────
+// Phone-viewport mode for the SAME Chrome tab: device metrics + touch + UA.
+// While active, every click tool routes through calibrated TOUCH taps —
+// React-Native-Web registers touch/pointer handlers in a touch environment
+// and ignores dispatched mouse events entirely (found live 2026-07-28:
+// click_ref/click_xy silently no-oped on app.empir3.com in phone mode).
+// NOTE: Emulation.setEmitTouchEventsForMouse is deliberately NOT used — it
+// wedges Input.dispatchMouseEvent into a CDP timeout for every mouse tool.
+const DEVICE_PRESETS: Record<string, { width: number; height: number; dpr: number; ua: string }> = {
+  iphone14: {
+    width: 390, height: 844, dpr: 3,
+    ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+  },
+  pixel7: {
+    width: 412, height: 915, dpr: 2.625,
+    ua: 'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
+  },
+};
+let deviceEmulation: { preset: string; width: number; height: number } | null = null;
+// CDP emulation overrides live exactly as long as the debugger session that
+// set them — and the bridge's normal cdpSend opens a fresh socket per command,
+// so overrides applied through it evaporate immediately (UA/touch don't even
+// survive one reload). This session is held open for the lifetime of the
+// emulation; closing it is what turns emulation off.
+let emulationSession: { targetId: string; send: (m: string, p?: any, t?: number) => Promise<any>; onEvent: (listener: (event: any) => void) => () => void; close: () => void } | null = null;
+
+const EMULATION_READBACK_EXPRESSION = 'JSON.stringify({innerWidth:innerWidth,innerHeight:innerHeight,maxTouchPoints:navigator.maxTouchPoints,ontouchstart:("ontouchstart" in window),dpr:devicePixelRatio})';
+
+async function readEmulationBack(session: { send: (m: string, p?: any, t?: number) => Promise<any> }): Promise<any> {
+  try {
+    const r = await session.send('Runtime.evaluate', { expression: EMULATION_READBACK_EXPRESSION, returnByValue: true }, 2000);
+    const raw = r?.result?.value;
+    return typeof raw === 'string' ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function setDeviceEmulation(preset: string, width?: number, height?: number, reload = false): Promise<any> {
+  // Always drop the previous hold — switching presets re-applies cleanly.
+  if (emulationSession) {
+    // Restore the page that owns the override, even if another tab is current.
+    try {
+      await emulationSession.send('Emulation.clearDeviceMetricsOverride', {});
+      await emulationSession.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+      await emulationSession.send('Emulation.setScrollbarsHidden', { hidden: false });
+    } catch { /* closed target */ }
+    emulationSession.close();
+    emulationSession = null;
+  }
+  if (preset === 'off') {
+    // Session close auto-clears UA + touch, but Chrome latches a dead
+    // session's METRICS override — and a bare clearDeviceMetricsOverride from
+    // a fresh session is a no-op against it. Set-then-clear on one session is
+    // what actually restores the real viewport (probed on Chrome 126).
+    try {
+      const session = await openPageCdpSession();
+      try {
+        await session.send('Emulation.setDeviceMetricsOverride', { width: 800, height: 600, deviceScaleFactor: 1, mobile: false });
+        await session.send('Emulation.clearDeviceMetricsOverride', {});
+        await session.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+      } finally {
+        session.close();
+      }
+    } catch { /* browser gone — nothing to restore */ }
+    deviceEmulation = null;
+    return { emulation: null };
+  }
+  const base = DEVICE_PRESETS[preset];
+  if (!base && !(width && height)) {
+    throw new Error(`Unknown preset "${preset}" — use ${Object.keys(DEVICE_PRESETS).join('/')}, "custom" with width+height, or "off"`);
+  }
+  const w = Number(width || base?.width);
+  const h = Number(height || base?.height);
+  const session = await openPageCdpSession();
+  try {
+    await session.send('Emulation.setDeviceMetricsOverride', {
+      width: w, height: h, deviceScaleFactor: base?.dpr ?? 2, mobile: true,
+      screenWidth: w, screenHeight: h,
+    });
+    await session.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
+    if (base?.ua) {
+      await session.send('Emulation.setUserAgentOverride', { userAgent: base.ua, platform: preset === 'iphone14' ? 'iPhone' : 'Linux armv81' });
+    }
+    // Classic scrollbars steal CSS px from the emulated viewport; phones use
+    // overlay scrollbars, so hide them for a viewport that matches the preset.
+    try { await session.send('Emulation.setScrollbarsHidden', { hidden: true }, 1500); } catch {}
+  } catch (e) {
+    session.close();
+    throw e;
+  }
+  emulationSession = session;
+  deviceEmulation = { preset, width: w, height: h };
+  // Touch handlers (`ontouchstart` in window) are bound when a document is
+  // created, so a page loaded before the override never gets them until it
+  // reloads. Reload on request, then read the page back and report what it
+  // actually sees rather than what was asked for.
+  if (reload) {
+    try { await session.send('Page.reload', {}, 3000); } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 900));
+  }
+  const measured = await readEmulationBack(session);
+  const consistency = emulationConsistency({ width: w, height: h }, measured);
+  return {
+    emulation: deviceEmulation,
+    reloaded: !!reload,
+    measured,
+    consistency,
+    ...(consistency.reloadRequired ? { note: consistency.notes.join(' ') } : {}),
+  };
+}
+
+/** One persistent CDP connection for a whole touch gesture. The bridge's
+ *  normal cdpSend opens a FRESH WebSocket per command — fine for stateless
+ *  commands, fatal for touch: Chrome auto-cancels an in-flight touch when the
+ *  debugger session that started it disconnects, so touchStart-then-touchEnd
+ *  over per-command sockets delivers the start, cancels it on socket close,
+ *  and rejects the end with "Must send a TouchStart first". */
+async function openPageCdpSession(): Promise<{ targetId: string; send: (method: string, params?: any, timeoutMs?: number) => Promise<any>; onEvent: (listener: (event: any) => void) => () => void; close: () => void }> {
+  const target = await currentPageTarget();
+  const ws = new WebSocket(target.webSocketDebuggerUrl);
+  await new Promise<void>((resolveOpen, rejectOpen) => {
+    const t = setTimeout(() => rejectOpen(new Error('CDP gesture session open timeout')), 5000);
+    ws.on('open', () => { clearTimeout(t); resolveOpen(); });
+    ws.on('error', (e: any) => { clearTimeout(t); rejectOpen(e instanceof Error ? e : new Error(String(e))); });
+  });
+  const listeners = new Set<(event: any) => void>();
+  const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  ws.on('message', (data: Buffer) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.method) for (const listener of listeners) listener(msg);
+      const p = pending.get(msg.id);
+      if (!p) return;
+      pending.delete(msg.id);
+      clearTimeout(p.timer);
+      if (msg.error) p.reject(new Error(msg.error.message));
+      else p.resolve(msg.result);
+    } catch { /* non-JSON frame */ }
+  });
+  ws.on('close', () => {
+    for (const listener of listeners) listener({ method: 'Bridge.sessionClosed' });
+    for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error('CDP gesture session closed')); }
+    pending.clear();
+  });
+  const send = (method: string, params: any = {}, timeoutMs = CDP_COMMAND_TIMEOUT_MS) => new Promise<any>((resolve, reject) => {
+    const id = cdpId++;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(method === 'Input.dispatchTouchEvent'
+      ? 'Touch input did not complete (CDP gesture timeout on Input.dispatchTouchEvent). The page target may not have touch enabled. If device emulation is active, retry; if it keeps failing, drive this with desktop_click via page_to_screen instead of a browser tap.'
+      : `CDP gesture timeout: ${method}`)); }, timeoutMs);
+    pending.set(id, { resolve, reject, timer });
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+  return { targetId: target.id, send, onEvent: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; }, close: () => { listeners.clear(); try { ws.close(); } catch { /* already closed */ } } };
+}
+
+/** CDP Input coordinates are scaled by the browser's zoom level (a 90%-zoomed
+ *  window lands a touch sent at x=347 on CSS x=312). Probe with a cancelled
+ *  touch and an injected once-listener to measure the actual scale — cheap
+ *  and immune to zoom/origin changes, so it runs per gesture. The probe rides
+ *  the same session as the gesture; the cancel guarantees no synthetic click. */
+async function measureTouchScaleOn(session: { send: (m: string, p?: any) => Promise<any> }): Promise<number> {
+  try {
+    await cdpEvaluate(`(function(){
+      window.__e3TapProbe = null;
+      document.addEventListener('touchstart', function(e){
+        var t = e.touches && e.touches[0];
+        if (t) window.__e3TapProbe = { x: t.clientX, y: t.clientY };
+      }, { capture: true, once: true, passive: true });
+      return 'armed';
+    })()`);
+    const PX = 100;
+    await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: PX, y: PX }] });
+    await session.send('Input.dispatchTouchEvent', { type: 'touchCancel', touchPoints: [] });
+    const got = await cdpEvaluate('JSON.stringify(window.__e3TapProbe || null)');
+    const probe = JSON.parse(got || 'null');
+    if (probe && probe.x > 0) {
+      const scale = probe.x / PX;
+      if (scale > 0.25 && scale < 4) return scale;
+    }
+  } catch { /* fall through to 1:1 */ }
+  return 1;
+}
+
+/**
+ * Touch dispatch needs touch ENABLED on the session doing the dispatching.
+ *
+ * Every gesture opens its own page CDP session, and a fresh session does not
+ * inherit the touch emulation that browser_emulate_device set elsewhere. Sending
+ * Input.dispatchTouchEvent to a target whose session has no touch support does
+ * not error - it HANGS, and surfaces as `CDP gesture timeout:
+ * Input.dispatchTouchEvent` after the command timeout.
+ *
+ * Measured 2026-09-15: with iphone14 emulation active (390x844, maxTouchPoints
+ * 5 as seen by the page) every browser_click_xy failed that way. Since click
+ * tools deliberately switch to touch under emulation - RN-Web ignores mouse
+ * events in a touch environment - that left NO working click at all: mouse
+ * bypassed by design, touch hanging. A whole class of mobile QA was
+ * unreachable through the bridge.
+ *
+ * Idempotent and cheap, so it runs per gesture rather than being tracked.
+ */
+async function ensureTouchOnSession(session: { send: (m: string, p?: any, timeoutMs?: number) => Promise<any> }): Promise<void> {
+  try {
+    await session.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 }, 2000);
+  } catch { /* older targets refuse it; the dispatch below still reports honestly */ }
+}
+
+async function tapAtXY(cssX: number, cssY: number): Promise<void> {
+  const held = emulationSession?.targetId === currentTargetId ? emulationSession : null;
+  const session = held || await openPageCdpSession();
+  try {
+    await ensureTouchOnSession(session);
+    const scale = await measureTouchScaleOn(session);
+    const x = cssX / scale;
+    const y = cssY / scale;
+    await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+    await sleep(60);
+    await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  } finally {
+    if (!held) session.close();
+  }
+}
+
+async function swipeXY(x1: number, y1: number, x2: number, y2: number, durationMs = 300): Promise<void> {
+  const held = emulationSession?.targetId === currentTargetId ? emulationSession : null;
+  const session = held || await openPageCdpSession();
+  try {
+    await ensureTouchOnSession(session);
+    const scale = await measureTouchScaleOn(session);
+    const steps = Math.max(6, Math.min(24, Math.round(durationMs / 16)));
+    await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: x1 / scale, y: y1 / scale }] });
+    for (let i = 1; i <= steps; i++) {
+      await session.send('Input.dispatchTouchEvent', {
+        type: 'touchMove',
+        touchPoints: [{ x: (x1 + ((x2 - x1) * i) / steps) / scale, y: (y1 + ((y2 - y1) * i) / steps) / scale }],
+      });
+      await sleep(durationMs / steps);
+    }
+    await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  } finally {
+    if (!held) session.close();
+  }
+}
+
+async function clickByXY(x: number, y: number): Promise<void> {
+  // Phone mode: real touch, not mouse — RN-Web ignores mouse in touch envs.
+  if (deviceEmulation && emulationSession?.targetId === currentTargetId) {
+    await tapAtXY(x, y);
+    return;
+  }
+  await cdpSend('Input.dispatchMouseEvent', {
+    type: 'mouseMoved',
+    x,
+    y,
+    button: 'none',
+  });
+  await sleep(40);
+  await cdpSend('Input.dispatchMouseEvent', {
+    type: 'mousePressed',
+    x,
+    y,
+    button: 'left',
+    buttons: 1,
+    clickCount: 1,
+  });
+  await sleep(40);
+  await cdpSend('Input.dispatchMouseEvent', {
+    type: 'mouseReleased',
+    x,
+    y,
+    button: 'left',
+    buttons: 0,
+    clickCount: 1,
+  });
+}
+
+async function typeText(text: string): Promise<void> {
+  for (const char of text) {
+    await cdpSend('Input.dispatchKeyEvent', {
+      type: 'keyDown',
+      text: char,
+      key: char,
+      unmodifiedText: char,
+    });
+    await cdpSend('Input.dispatchKeyEvent', {
+      type: 'keyUp',
+      key: char,
+    });
+    await sleep(20);
+  }
+}
+
+async function pressKey(key: string): Promise<void> {
+  // Map common key names to CDP key codes
+  // `text` matters: CDP only fires a key's DEFAULT ACTION (form submit on
+  // Enter, newline in a textarea, the space char) when the keyDown carries the
+  // produced character — same reason typeText() sets text per char. Without it
+  // the event reaches JS listeners but the browser does nothing (verified
+  // 2026-06-02: Enter on a focused search field never submitted). Keys with no
+  // character (Tab/Escape/arrows) intentionally have no text.
+  const keyMap: Record<string, { key: string; code: string; keyCode: number; text?: string }> = {
+    'Enter': { key: 'Enter', code: 'Enter', keyCode: 13, text: '\r' },
+    'Tab': { key: 'Tab', code: 'Tab', keyCode: 9 },
+    'Escape': { key: 'Escape', code: 'Escape', keyCode: 27 },
+    'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8 },
+    'Delete': { key: 'Delete', code: 'Delete', keyCode: 46 },
+    'ArrowUp': { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 },
+    'ArrowDown': { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
+    'ArrowLeft': { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
+    'ArrowRight': { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+    'Space': { key: ' ', code: 'Space', keyCode: 32, text: ' ' },
+    'Home': { key: 'Home', code: 'Home', keyCode: 36 },
+    'End': { key: 'End', code: 'End', keyCode: 35 },
+    'PageUp': { key: 'PageUp', code: 'PageUp', keyCode: 33 },
+    'PageDown': { key: 'PageDown', code: 'PageDown', keyCode: 34 },
+    'Insert': { key: 'Insert', code: 'Insert', keyCode: 45 },
+  };
+  for (let number = 1; number <= 24; number++) keyMap[`F${number}`] = { key: `F${number}`, code: `F${number}`, keyCode: 111 + number };
+  const aliases: Record<string, string> = { esc: 'Escape', return: 'Enter', del: 'Delete', spacebar: 'Space', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', pgup: 'PageUp', pgdn: 'PageDown' };
+
+  // Handle modifier combos like "Control+a"
+  // Models commonly use ENTER/enter. Named keys are case-insensitive; retain
+  // the case of literal characters so typing A does not become a.
+  const namedKey = (value: string) => keyMap[aliases[value.toLowerCase()] || Object.keys(keyMap).find(name => name.toLowerCase() === value.toLowerCase()) || value];
+  if (key.length > 1 && key.includes('+')) {
+    const parts = key.split('+');
+    if (key.endsWith('++')) { parts.pop(); parts[parts.length - 1] = '+'; }
+    const mainKey = parts.pop()!;
+    const modifierBits: Record<string, number> = { control: 2, ctrl: 2, shift: 8, alt: 1, meta: 4, cmd: 4, command: 4, win: 4 };
+    let modifiers = 0;
+    for (const part of parts) {
+      const bit = modifierBits[part.toLowerCase()];
+      if (!bit) throw new Error(`Unknown key modifier "${part}". Use Ctrl, Shift, Alt or Meta.`);
+      modifiers |= bit;
+    }
+    const named = namedKey(mainKey);
+    if (!named && mainKey.length !== 1) throw new Error(`Unknown key "${mainKey}". Use a named browser key or type text instead.`);
+    const virtualKeyCode = named?.keyCode || (mainKey.length === 1 ? mainKey.toUpperCase().charCodeAt(0) : 0);
+    const code = named?.code || (/^[0-9]$/.test(mainKey) ? `Digit${mainKey}` : /^[a-z]$/i.test(mainKey) ? `Key${mainKey.toUpperCase()}` : mainKey);
+    const shifted: Record<string, string> = { '1':'!', '2':'@', '3':'#', '4':'$', '5':'%', '6':'^', '7':'&', '8':'*', '9':'(', '0':')', '-':'_', '=':'+', '[':'{', ']':'}', ';':':', "'":'"', ',':'<', '.':'>', '/':'?', '\\':'|', '`':'~' };
+    const eventKey = named?.key || (modifiers & 8 ? shifted[mainKey] || mainKey.toUpperCase() : mainKey);
+    const text = (modifiers & (1 | 2 | 4)) === 0 ? (named?.text ?? (mainKey.length === 1 ? eventKey : undefined)) : undefined;
+
+    await cdpSend('Input.dispatchKeyEvent', {
+      type: 'keyDown',
+      key: eventKey,
+      code,
+      modifiers,
+      windowsVirtualKeyCode: virtualKeyCode,
+      nativeVirtualKeyCode: virtualKeyCode,
+      ...(text === undefined ? {} : { text, unmodifiedText: named?.text ?? mainKey }),
+    });
+    await cdpSend('Input.dispatchKeyEvent', {
+      type: 'keyUp',
+      key: eventKey,
+      code,
+      modifiers,
+      windowsVirtualKeyCode: virtualKeyCode,
+      nativeVirtualKeyCode: virtualKeyCode,
+    });
+    return;
+  }
+
+  if (!namedKey(key) && key.length !== 1) throw new Error(`Unknown key "${key}". Use a named browser key or type text instead.`);
+  const mapped = namedKey(key) || { key, code: key, keyCode: 0 };
+  // A bare single character passed to press ("a") should also type, so give it
+  // text too; mapped.text wins for the named keys above.
+  const text = mapped.text !== undefined ? mapped.text : (key.length === 1 ? key : undefined);
+  const down: any = {
+    type: 'keyDown',
+    key: mapped.key,
+    code: mapped.code,
+    windowsVirtualKeyCode: mapped.keyCode,
+  };
+  if (text !== undefined) { down.text = text; down.unmodifiedText = text; }
+  await cdpSend('Input.dispatchKeyEvent', down);
+  await cdpSend('Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key: mapped.key,
+    code: mapped.code,
+    windowsVirtualKeyCode: mapped.keyCode,
+  });
+}
+
+// ─── HTTP Server ─────────────────────────────────────────────
+
+function parseBody(req: IncomingMessage): Promise<any> {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+    req.on('end', () => {
+      try { resolve(JSON.parse(body)); }
+      catch { resolve({}); }
+    });
+  });
+}
+
+function sendJSON(res: ServerResponse, data: any, status = 200) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(data));
+}
+
+function sendError(res: ServerResponse, msg: string, status = 500) {
+  sendJSON(res, { error: msg }, status);
+}
+
+function readRawBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+async function proxyWrapperRequest(req: IncomingMessage, res: ServerResponse, targetPath: string) {
+  const method = req.method || 'GET';
+  const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readRawBody(req);
+  const headers: Record<string, string> = {
+    'Accept': 'application/json',
+  };
+  const contentType = req.headers['content-type'];
+  if (contentType) headers['Content-Type'] = Array.isArray(contentType) ? contentType[0] : contentType;
+  if (body.length) headers['Content-Length'] = String(body.length);
+
+  await new Promise<void>((resolve) => {
+    const proxy = httpRequest({
+      hostname: '127.0.0.1',
+      port: WRAPPER_PORT,
+      path: targetPath,
+      method,
+      headers,
+    }, (proxyRes) => {
+      const responseHeaders = { ...proxyRes.headers };
+      delete responseHeaders['access-control-allow-origin'];
+      res.writeHead(proxyRes.statusCode || 502, responseHeaders);
+      proxyRes.pipe(res);
+      proxyRes.on('end', resolve);
+    });
+    proxy.on('error', (e: Error) => {
+      if (!res.headersSent) {
+        sendJSON(res, { ok: false, error: `Bridge setup API unavailable: ${e.message}` }, 502);
+      } else {
+        res.end();
+      }
+      resolve();
+    });
+    if (body.length) proxy.write(body);
+    proxy.end();
+  });
+}
+
+function checkAuth(req: IncomingMessage): boolean {
+  if (!SESSION_TOKEN) return true; // No token configured = no auth
+  const auth = req.headers.authorization || '';
+  return auth === `Bearer ${SESSION_TOKEN}`;
+}
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse) {
+  const url = new URL(req.url || '/', `http://localhost:${PORT}`);
+  const path = url.pathname;
+  const method = req.method || 'GET';
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  const refusal = cdpHttpRefusal(req.headers, { port:PORT, host:HOST, method, pathname:path });
+  if (refusal) { sendError(res, refusal, 403); return; }
+
+  // CORS preflight
+  if (method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Allow': 'GET, POST, OPTIONS',
+    });
+    res.end();
+    return;
+  }
+
+  // Preserve old bookmarks without maintaining a second sign-in/config UI.
+  if (path === '/welcome' && method === 'GET') {
+    res.writeHead(302, { Location: `http://localhost:${WRAPPER_PORT}/welcome${url.search}` });
+    res.end();
+    return;
+  }
+
+  // Health — no auth needed
+  if (path === '/health') {
+    // Wrapper and scale health callers use a 2.5s budget. A wedged CDP must not
+    // make the healthy daemon itself look unreachable.
+    const browserRunning = await hasReachablePageTarget(1000);
+    if (browserRunning && chromeClosedByUser) {
+      console.log('[Empir3 Bridge] Health probe cleared stale closed-browser latch; CDP page is reachable');
+      chromeClosedByUser = false;
+      startTargetPolling();
+    }
+    const hasOpenCdpSocket = !!cdpWs && cdpWs.readyState === WebSocket.OPEN;
+    const hasRecentCdpCommand = connected && lastCdpLivenessAt > 0 && Date.now() - lastCdpLivenessAt < 15000;
+    const hasKnownPage = !!currentTargetId || knownTargets.size > 0;
+    const cdpConnected = browserRunning && !chromeClosedByUser && (hasOpenCdpSocket || hasRecentCdpCommand || hasKnownPage);
+    const trackedLauncher = chromeStatus();
+    sendJSON(res, {
+      status: cdpConnected ? 'connected' : 'disconnected',
+      port: PORT,
+      cdpPort: CDP_PORT,
+      chrome: browserRunning ? 'running' : trackedLauncher,
+      trackedLauncher,
+      browserRunning,
+      closedByUser: chromeClosedByUser,
+      cdpConnected,
+    });
+    return;
+  }
+
+  // Setup proxies use the same optional native-client token as CDP commands.
+  if (!checkAuth(req)) {
+    sendError(res, 'Unauthorized', 401);
+    return;
+  }
+
+  if (
+    path === '/api/relay-status' ||
+    path === '/api/command' ||
+    path === '/api/install/claude-code' ||
+    path === '/api/install/empir3-pair' ||
+    path === '/api/install/empir3-login' ||
+    path === '/api/install/sign-out'
+  ) {
+    await proxyWrapperRequest(req, res, path + url.search);
+    return;
+  }
+
+  try {
+    // ── GET endpoints ──────────────────────────
+
+    if (method === 'GET' && path === '/screenshot') {
+      await ensureChromeReady();
+      const quality = parseInt(url.searchParams.get('quality') || '80');
+      const maxWidth = url.searchParams.get('maxWidth') ? parseInt(url.searchParams.get('maxWidth')!) : undefined;
+      const fullPage = url.searchParams.get('fullPage') === 'true';
+      const maxHeight = Math.max(1_000, Math.min(20_000, parseInt(url.searchParams.get('maxHeight') || '12000')));
+      const params: any = { format: 'jpeg', quality };
+      if (fullPage) {
+        try {
+          const evalResult = await cdpSend('Runtime.evaluate', {
+            expression: 'JSON.stringify({w:Math.max(document.documentElement.scrollWidth,document.body?.scrollWidth||0,window.innerWidth),h:Math.max(document.documentElement.scrollHeight,document.body?.scrollHeight||0,window.innerHeight),dpr:window.devicePixelRatio||1})',
+            returnByValue: true,
+          });
+          const page = JSON.parse(evalResult.result.value);
+          const width = Math.max(1, Number(page.w) || 1);
+          const height = Math.max(1, Math.min(Number(page.h) || 1, maxHeight));
+          const physicalWidth = width * (Number(page.dpr) || 1);
+          const scale = maxWidth && physicalWidth > maxWidth
+            ? Math.max(0.1, Math.min(1, maxWidth / physicalWidth))
+            : 1;
+          params.captureBeyondViewport = true;
+          params.fromSurface = true;
+          params.clip = { x: 0, y: 0, width, height, scale };
+        } catch {
+          // Fall back to the current viewport if page metrics are unavailable.
+        }
+      } else if (maxWidth && maxWidth > 0) {
+        try {
+          const evalResult = await cdpSend('Runtime.evaluate', {
+            expression: 'JSON.stringify({w:window.innerWidth,h:window.innerHeight,dpr:window.devicePixelRatio||1,sx:window.scrollX||0,sy:window.scrollY||0})',
+            returnByValue: true,
+          });
+          const vp = JSON.parse(evalResult.result.value);
+          if (vp.w > 0 && vp.h > 0 && vp.dpr > 0) {
+            const physicalWidth = vp.w * vp.dpr;
+            if (physicalWidth > maxWidth) {
+              const scale = Math.max(0.1, Math.min(2.0, maxWidth / physicalWidth));
+              params.clip = viewportClip(vp, scale);   // page coords: offset by the scroll (see viewportClip)
+            }
+          }
+        } catch {}
+      }
+      const result = await captureScreenshot(params);
+      const buf = Buffer.from(result.data, 'base64');
+      if (url.searchParams.get('format') === 'json') {
+        // Only return JSON if explicitly requested
+        sendJSON(res, { data: result.data, format: 'jpeg' });
+      } else {
+        // Default: return raw JPEG bytes (works with ?raw=true for backwards compat)
+        res.writeHead(200, {
+          'Content-Type': 'image/jpeg',
+          'Content-Length': buf.length.toString(),
+        });
+        res.end(buf);
+      }
+      return;
+    }
+
+    if (method === 'GET' && path === '/snapshot') {
+      await ensureChromeReady();
+      const ready = await waitForBrowserPage(timeout => cdpEvaluate(PAGE_READINESS_EXPRESSION,timeout));
+      if(!ready.success){sendJSON(res,ready);return;}
+      const filter = url.searchParams.get('filter') || 'interactive';
+      const nodes = await getAccessibilityTree(filter);
+      const visibleFrames = await cdpEvaluate('Array.from(document.querySelectorAll("iframe,frame")).filter(el=>{const r=el.getBoundingClientRect();return r.width>0 && r.height>0 && r.right>0 && r.bottom>0 && r.left<innerWidth && r.top<innerHeight && getComputedStyle(el).visibility!=="hidden"}).length');
+      sendJSON(res, { count: nodes.length, nodes, visibleFrames, scope: 'main-document', fallback: 'If visible controls are missing, use browser_screenshot, browser_click_xy and browser_type without selector. Keep the explicit browser target and verify the result.' });
+      return;
+    }
+
+    if (method === 'GET' && path === '/text') {
+      await ensureChromeReady();
+      const text = await cdpEvaluate(`(function() {
+        const title = document.title || '';
+        // The bridge injects its overlay UI (chat sidebar, toolbar, ghost
+        // cursor, etc.) into the page's light DOM under id="empir3-*" roots.
+        // Its text ("Bridge Disconnected / Snap / Draw / Send / …") otherwise
+        // pollutes innerText and breaks downstream parsing for agents. Detach
+        // the top-level overlay roots, read innerText (forces a synchronous
+        // reflow without them), then restore them in place — all within one JS
+        // turn so there is no visible flicker and overlay state is preserved.
+        const roots = Array.prototype.slice.call(document.querySelectorAll('[id^="empir3-"]'))
+          .filter(function(el){ return !(el.parentElement && el.parentElement.closest('[id^="empir3-"]')); });
+        const saved = roots.map(function(el){ return { el: el, parent: el.parentNode, next: el.nextSibling }; });
+        saved.forEach(function(s){ if (s.parent) s.parent.removeChild(s.el); });
+        let body = '';
+        try { body = document.body ? document.body.innerText : ''; }
+        finally {
+          saved.forEach(function(s){
+            if (!s.parent) return;
+            if (s.next && s.next.parentNode === s.parent) s.parent.insertBefore(s.el, s.next);
+            else s.parent.appendChild(s.el);
+          });
+        }
+        return JSON.stringify({ title, url: location.href, contentType: document.contentType || 'unknown', readyState: document.readyState, text: body.slice(0, 50000), truncated: body.length > 50000 });
+      })()`);
+      const result = JSON.parse(text);
+      if (!String(result.text || '').trim()) {
+        sendJSON(res, { ...result, success: false, code: 'text_extraction_empty', error: `No readable page text was extracted (content type: ${result.contentType}; page state: ${result.readyState}). This does not establish that the page or dataset is empty. Inspect a browser screenshot, wait if the page is still loading, or read the same records from an accessible HTML/source page. Do not report zero records from this result.` });
+      } else {
+        sendJSON(res, { ...result, success: true });
+      }
+      return;
+    }
+
+    if (method === 'GET' && path === '/tabs') {
+      let targets: any[] = [];
+      try {
+        targets = await Promise.race([
+          fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`),
+          sleep(1500).then(() => null),
+        ]) as any[] | null || [];
+      } catch {
+        sendJSON(res, { tabs: [], currentTargetId: '', chrome: chromeStatus(), closedByUser: chromeClosedByUser });
+        return;
+      }
+      if (!targets.length && knownTargets.size > 0) {
+        const tabs = Array.from(knownTargets.entries()).map(([id, url]) => ({
+          id,
+          title: '',
+          url,
+          type: 'page',
+          active: id === currentTargetId,
+          badge: tabBadges.get(id) || undefined,
+        }));
+        sendJSON(res, { tabs, currentTargetId, chrome: chromeStatus(), closedByUser: chromeClosedByUser });
+        return;
+      }
+      const tabs = targets
+        .filter((t: any) => t.type === 'page')
+        .map((t: any) => ({
+          id: t.id,
+          title: t.title,
+          url: t.url,
+          type: t.type,
+          active: t.id === currentTargetId,
+          badge: tabBadges.get(t.id) || undefined,
+        }));
+      sendJSON(res, { tabs, currentTargetId, chrome: chromeStatus(), closedByUser: chromeClosedByUser });
+      return;
+    }
+
+    // ── POST endpoints ─────────────────────────
+
+    if (method === 'POST') {
+      const body = await parseBody(req);
+      if(path==='/act-preflight') {
+        await ensureChromeReady();
+        const ready=await waitForBrowserPage(timeout=>cdpEvaluate(PAGE_READINESS_EXPRESSION,timeout),{requireVisible:true});
+        sendJSON(res,{...ready,targetId:currentTargetId});return;
+      }
+
+      if(path==='/record-start') {
+        await ensureChromeReady();
+        const targets=await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+        const target=targets.find((t:any)=>t.id===(body.targetId||currentTargetId)&&t.type==='page');
+        if(!target?.webSocketDebuggerUrl)throw new Error('Recording target unavailable.');
+        sendJSON(res,await browserRecorder.start(target.webSocketDebuggerUrl,target.id));return;
+      }
+      if(path==='/record-stop'){sendJSON(res,await browserRecorder.stop());return;}
+
+      // Evaluate JS on a specific target without switching active tab
+      if (path === '/evaluate-on-target') {
+        const { targetId, expression } = body;
+        if (!targetId || !expression) throw new Error('targetId and expression required');
+        browserDialogs.check(targetId);
+        const timeoutMs = Math.max(250, Math.min(10000, Number(body.timeoutMs) || CDP_COMMAND_TIMEOUT_MS));
+        const evaluate = async () => ({ok:true,result:await evaluateOnTarget(targetId, expression, timeoutMs)});
+        // Structured selection/toggle handlers can open a website dialog too.
+        // Read-only observations of other tabs keep their non-focusing path.
+        if(body.observeDialogs===true && targetId!==currentTargetId)throw new Error('target_not_current: select the intended tab before input.');
+        sendJSON(res, body.observeDialogs===true ? await browserDialogs.run(targetId,evaluate) : await evaluate());
+        return;
+      }
+
+      // Evaluate JS on ALL page targets (used for overlay injection)
+      if (path === '/evaluate-all') {
+        const { expression } = body;
+        if (!expression) throw new Error('expression required');
+        const timeoutMs = Math.max(250, Math.min(10000, Number(body.timeoutMs) || CDP_COMMAND_TIMEOUT_MS));
+        const results = await evaluateOnAllTargets(expression, timeoutMs);
+        sendJSON(res, { ok: true, results });
+        return;
+      }
+
+      // Register a script to auto-inject into every new tab
+      if (path === '/register-auto-inject') {
+        autoInjectScript = body.script || '';
+        // Immediately inject into all existing tabs
+        let results: any[] = [];
+        if (autoInjectScript) {
+          results = await evaluateOnAllTargets(autoInjectScript);
+          startTargetPolling();
+        } else {
+          stopTargetPolling();
+        }
+        sendJSON(res, { ok: true, registered: !!autoInjectScript, injected: results });
+        return;
+      }
+
+      // 0.3.46 per-agent tabs: open a NEW tab (Target.createTarget on the
+      // browser WS) and make it current. The wrapper calls this when a
+      // driving agent has no live tab yet.
+      if (path === '/create-tab') {
+        await ensureChromeReady({ allowRelaunch: true });
+        await ensureBrowserWsReady();
+        const url = typeof body.url === 'string' && body.url.trim() ? body.url.trim() : 'about:blank';
+        const created = await browserSend('Target.createTarget', { url });
+        const targetId = String(created?.targetId || '');
+        if (!targetId) throw new Error('Target.createTarget returned no targetId');
+        await switchToTarget(targetId);
+        try { await cdpSend('Page.bringToFront'); } catch {}
+        sendJSON(res, { ok: true, targetId, url });
+        return;
+      }
+
+      // Close exactly one page target and do not claim success until Chrome's
+      // target inventory proves it is gone. Other agents keep their tabs.
+      if (path === '/close-target') {
+        await ensureChromeReady({ allowRelaunch: false });
+        const targetId = typeof body.targetId === 'string' && body.targetId.trim()
+          ? body.targetId.trim()
+          : currentTargetId;
+        if (!targetId) throw new Error('close-target requires targetId');
+        const before = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+        if (!before.some((target: any) => target.type === 'page' && target.id === targetId)) {
+          sendJSON(res, { ok: true, success: true, closed: true, alreadyClosed: true, targetId });
+          return;
+        }
+        await ensureBrowserWsReady(5000);
+        const closeResult = await browserSend('Target.closeTarget', { targetId });
+        if (closeResult?.success !== true) throw new Error(`Chrome refused to close target ${targetId}`);
+        const deadline = Date.now() + 5000;
+        let closed = false;
+        while (Date.now() < deadline) {
+          try {
+            const targets = await fetchJSON(`http://127.0.0.1:${CDP_PORT}/json`);
+            if (!targets.some((target: any) => target.type === 'page' && target.id === targetId)) {
+              closed = true;
+              break;
+            }
+          } catch {
+            // Closing Chrome's last page can terminate the browser process and
+            // its CDP listener before this confirmation poll completes. The
+            // process exit handler is independent evidence that this target is
+            // gone. A CDP hiccup while Chrome remains alive is inconclusive and
+            // keeps polling until the normal timeout.
+            if (!chromeProcess || chromeClosedByUser) {
+              closed = true;
+              break;
+            }
+          }
+          await sleep(100);
+        }
+        if (!closed) throw new Error(`Chrome did not confirm target ${targetId} closed`);
+        knownTargets.delete(targetId);
+        tabBadges.delete(targetId);
+        if (currentTargetId === targetId) {
+          currentTargetId = '';
+          connected = false;
+          lastCdpLivenessAt = 0;
+          if (cdpWs) { try { cdpWs.close(); } catch {} }
+          cdpWs = null;
+        }
+        sendJSON(res, { ok: true, success: true, closed: true, targetId });
+        return;
+      }
+
+      // 0.3.46: assign (or clear) a tab's who's-driving badge and stamp it now.
+      if (path === '/tab-badge') {
+        const targetId = typeof body.targetId === 'string' ? body.targetId : '';
+        if (!targetId) throw new Error('tab-badge requires targetId');
+        const agentName = sanitizeAgentName(body.agentName);
+        if (agentName) {
+          tabBadges.set(targetId, agentName);
+          stampTabBadge(targetId).catch(() => {});
+        } else {
+          tabBadges.delete(targetId);
+        }
+        sendJSON(res, { ok: true, targetId, agentName: agentName || null });
+        return;
+      }
+
+      if (path === '/activate-target') {
+        await ensureChromeReady({ allowRelaunch: false });
+        const targetId = typeof body.targetId === 'string' ? body.targetId : '';
+        if (!targetId) throw new Error('activate-target requires targetId');
+        await switchToTarget(targetId);
+        if (body.bringToFront !== false) {
+          try { await cdpSend('Page.bringToFront'); } catch {}
+        }
+        const target = await currentPageTarget();
+        let url = String(target.url || '');
+        let title = String(target.title || '');
+        try { url = await cdpEvaluate('location.href', 1200) || url; } catch {}
+        try { title = await cdpEvaluate('document.title', 1200) || title; } catch {}
+        sendJSON(res, { ok: true, targetId: currentTargetId, url, title });
+        return;
+      }
+
+      if (path === '/show') {
+        const url = typeof body.url === 'string' ? body.url : undefined;
+        const shownUrl = await showChromeWindow(url);
+        sendJSON(res, { ok: true, shown: true, url: shownUrl });
+        return;
+      }
+
+      if (path === '/navigate') {
+        await ensureChromeReady({ allowRelaunch: true });
+        const targetUrl = typeof body.url === 'string' && body.url.trim() ? body.url.trim() : '';
+        if (!targetUrl) throw new Error('navigate requires a non-empty url');
+        // Navigation belongs to the selected target. Reusing another tab with
+        // the same URL silently changed ownership mid-workflow/playback.
+        if(body.targetId && body.targetId!==currentTargetId)throw new Error('target_not_current: select the exact tab before navigation.');
+        sendJSON(res, await browserDialogs.run(currentTargetId, async () => {
+        await cdpNavigate(targetUrl);
+        let currentUrl = '';
+        let title = '';
+        currentUrl = await cdpEvaluate('location.href', 2500);
+        if (!currentUrl) throw new Error('Navigation could not verify the active page URL');
+        try { title = await cdpEvaluate('document.title', 1200); } catch {}
+        if (!title) {
+          const target = await currentPageTarget();
+          title = title || String(target.title || '');
+        }
+        return { title, url: currentUrl, targetId:currentTargetId, verified: true };
+        }));
+        return;
+      }
+
+      if (path === '/monitor/frame' || path === '/monitor/input') {
+        if(browserRecorder.ws)throw new Error('Stop browser recording before opening private monitor control.');
+        await ensureChromeReady();
+        const targetId=currentTargetId;
+        if(path==='/monitor/input' && body.targetId!==targetId)throw new Error('Browser tab changed. Wait for a fresh frame.');
+        const session=await openPageCdpSession();
+        try {
+          const metrics=await session.send('Runtime.evaluate',{expression:'({x:0,y:0,width:innerWidth,height:innerHeight})',returnByValue:true});
+          const bounds=metrics.result?.value;
+          if(!bounds?.width||!bounds?.height)throw new Error('Browser viewport is unavailable.');
+          if(path==='/monitor/frame') {
+            const shot=await session.send('Page.captureScreenshot',{format:'jpeg',quality:62,captureBeyondViewport:false});
+            sendJSON(res,{success:true,base64:shot.data,mimeType:'image/jpeg',targetId,bounds});
+          } else {
+            if(['width','height'].some(k=>bounds[k]!==body.bounds?.[k]))throw new Error('Browser resized. Wait for a fresh frame.');
+            await browserMonitorInput(session,body.input,bounds);
+            sendJSON(res,{success:true,dispatched:true});
+          }
+        } finally {session.close();}
+        return;
+      }
+
+      if (path === '/dialog') {
+        await ensureChromeReady();
+        if (!body.targetId || body.targetId !== currentTargetId) throw new Error('target_not_current: select the exact tab before handling its dialog.');
+        sendJSON(res, await browserDialogs.handle(body.targetId, body.action, body.dialogId, body.promptText));
+        return;
+      }
+
+      if (path === '/action') {
+        await ensureChromeReady();
+        const kind = body.kind;
+
+        switch (kind) {
+          case 'click':
+            if (body.ref) {
+              sendJSON(res, await browserDialogs.run(currentTargetId, () => clickByRef(String(body.ref))));
+            } else if (body.selector) {
+              sendJSON(res, await browserDialogs.run(currentTargetId, () => clickBrowserTarget(String(body.selector), `selector:${body.selector}`)));
+            } else if (typeof body.x === 'number' && typeof body.y === 'number') {
+              sendJSON(res, await browserDialogs.run(currentTargetId, async () => { await clickByXY(body.x, body.y); return { success: true, dispatched: true, verified: false, coordinates: { x: body.x, y: body.y } }; }));
+            } else {
+              throw new Error('Click requires a ref, selector, or x/y coordinates');
+            }
+            break;
+
+          case 'type': {
+            const typeTarget = body.ref
+              ? `[data-empir3-ref="${body.ref}"]`
+              : body.selector || null;
+
+            if (typeTarget) {
+              sendJSON(res, await browserDialogs.run(currentTargetId, () => typeIntoBrowserTarget(
+                typeTarget,
+                body.ref ? `ref:${body.ref}` : `selector:${body.selector}`,
+                String(body.text || ''),
+              )));
+            } else {
+              // No target — type into whatever is focused via keyboard events
+              sendJSON(res, await browserDialogs.run(currentTargetId, async () => { await typeText(body.text || ''); return { success: true, dispatched: true, verified: false, target: 'focused element' }; }));
+            }
+            break;
+          }
+
+          case 'selectAll':
+            await pressKey('Control+a');
+            sendJSON(res, { success: true });
+            break;
+
+          case 'press':
+            sendJSON(res, await browserDialogs.run(currentTargetId, async () => { await pressKey(body.key || body.text || ''); return { success: true, dispatched: true, verified: false, key: body.key || body.text || '' }; }));
+            break;
+
+          case 'scroll': {
+            // Accept dy/dx/deltaY/deltaX as aliases for y/x — callers reading
+            // "mouse wheel" docs send dy and used to get a silent 0px no-op.
+            const dx = Number(body.x ?? body.dx ?? body.deltaX ?? 0) || 0;
+            const dy = Number(body.y ?? body.dy ?? body.deltaY ?? 0) || 0;
+            const result = await cdpEvaluate(browserScrollExpression(dx, dy));
+            let scroll: any = result;
+            try { scroll = JSON.parse(result); } catch {}
+            sendJSON(res, { success: true, position: scroll?.after || scroll, scroll, moved: scroll?.moved === true });
+            break;
+          }
+
+          case 'focus':
+            if (body.ref) {
+              await cdpEvaluate(`(function() {
+                const el = document.querySelector('[data-empir3-ref="${body.ref}"]');
+                if (el) el.focus();
+              })()`);
+            }
+            sendJSON(res, { success: true });
+            break;
+
+          case 'emulate_device': {
+            const result = await setDeviceEmulation(String(body.preset || 'off'), body.width, body.height, body.reload === true);
+            sendJSON(res, { success: true, ...result });
+            break;
+          }
+
+          case 'tap': {
+            if (typeof body.x !== 'number' || typeof body.y !== 'number') {
+              sendError(res, 'tap requires numeric x and y', 400);
+              break;
+            }
+            await tapAtXY(body.x, body.y);
+            sendJSON(res, { success: true });
+            break;
+          }
+
+          case 'swipe': {
+            const nums = [body.x1, body.y1, body.x2, body.y2];
+            if (nums.some((n: any) => typeof n !== 'number')) {
+              sendError(res, 'swipe requires numeric x1, y1, x2, y2', 400);
+              break;
+            }
+            await swipeXY(body.x1, body.y1, body.x2, body.y2, Number(body.durationMs) || 300);
+            sendJSON(res, { success: true });
+            break;
+          }
+
+          case 'hover':
+            if (body.ref) {
+              const bounds = await cdpEvaluate(`(function() {
+                const el = document.querySelector('[data-empir3-ref="${body.ref}"]');
+                if (!el) return null;
+                const r = el.getBoundingClientRect();
+                return JSON.stringify({ x: r.x + r.width/2, y: r.y + r.height/2 });
+              })()`);
+              if (bounds) {
+                const { x, y } = JSON.parse(bounds);
+                await cdpSend('Input.dispatchMouseEvent', {
+                  type: 'mouseMoved', x, y,
+                });
+              }
+            }
+            sendJSON(res, { success: true });
+            break;
+
+          default:
+            sendError(res, `Unknown action: ${kind}`, 400);
+        }
+        return;
+      }
+
+      if (path === '/evaluate') {
+        await ensureChromeReady();
+        const ready=await waitForBrowserPage(timeout=>cdpEvaluate(PAGE_READINESS_EXPRESSION,timeout));
+        if(!ready.success){sendJSON(res,ready);return;}
+        sendJSON(res, await browserDialogs.run(currentTargetId, async () => ({ result: await cdpEvaluate(body.expression) })));
+        return;
+      }
+
+      if (path === '/cookies') {
+        await ensureChromeReady();
+        for (const cookie of (body.cookies || [])) {
+          await cdpSend('Network.setCookie', {
+            name: cookie.name,
+            value: cookie.value,
+            url: body.url,
+            domain: cookie.domain,
+            path: cookie.path || '/',
+          });
+        }
+        sendJSON(res, { success: true });
+        return;
+      }
+    }
+
+    sendError(res, `Not found: ${method} ${path}`, 404);
+  } catch (e: any) {
+    console.error(`[Empir3 Bridge] Error: ${e.message}`);
+    const structured = browserRefusal(e);
+    if (structured) {
+      sendJSON(res, structured);
+    } else {
+      sendError(res, e.message);
+    }
+  }
+}
+
+// ─── Utilities ───────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function fetchJSON(url: string, method: string = 'GET', timeoutMs = 3000): Promise<any> {
+  const { default: http } = await import('http');
+  const { URL } = await import('url');
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const u = new URL(url);
+    const req = http.request({
+      hostname: u.hostname,
+      port: u.port,
+      // Chrome's /json/new takes the URL as the raw query string (not encoded),
+      // so preserve u.search verbatim. http.request would re-serialize if we
+      // passed pathname/search separately.
+      path: u.pathname + u.search,
+      method,
+    }, (res) => {
+      let data = '';
+      res.on('data', (chunk: Buffer) => { data += chunk; });
+      res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        try { resolve(JSON.parse(data)); }
+        catch { reject(new Error(`Invalid JSON from ${url}`)); }
+      });
+    });
+    req.setTimeout(timeoutMs, () => {
+      if (settled) return;
+      settled = true;
+      req.destroy();
+      reject(new Error(`Timeout fetching ${url}`));
+    });
+    req.on('error', (e) => {
+      if (settled) return;
+      settled = true;
+      reject(e);
+    });
+    req.end();
+  });
+}
+
+// ─── Shutdown ────────────────────────────────────────────────
+
+function shutdown() {
+  console.log('[Empir3 Bridge] Shutting down...');
+  shuttingDown = true;
+  stopTargetPolling();
+  if (browserWs) { try { browserWs.close(); } catch {} }
+  if (cdpWs) cdpWs.close();
+  if (chromeProcess) {
+    chromeProcess.kill();
+  }
+  process.exit(0);
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+// ─── Main ────────────────────────────────────────────────────
+
+async function main() {
+  const server = createServer(handleRequest);
+
+  const ownsHttpPort = await new Promise<boolean>((resolve, reject) => {
+    let settled = false;
+    server.once('error', (e: NodeJS.ErrnoException) => {
+      if (settled) return;
+      settled = true;
+      if (e.code === 'EADDRINUSE') {
+        console.warn(`[Empir3 Bridge] HTTP server ${HOST}:${PORT} is already in use; using the existing bridge if its /health check passes.`);
+        resolve(false);
+        return;
+      }
+      reject(e);
+    });
+    server.listen(PORT, HOST, () => {
+      if (settled) return;
+      settled = true;
+      console.log(`[Empir3 Bridge] HTTP server on ${HOST}:${PORT}`);
+      resolve(true);
+    });
+  });
+
+  if (!ownsHttpPort) return;
+
+  // Lazy mode: no eager Chromium, no CDP poll loop. ensureChromeReady()
+  // launches on the first browser tool call; until then the bridge serves
+  // /health, shell, files and CLI lending with zero browser footprint.
+  if (!CHROME_AUTOLAUNCH) {
+    console.log('[Empir3 Bridge] Chrome autolaunch is off (EMPIR3_CHROME_AUTOLAUNCH=0) — Chromium starts on first browser tool use');
+    return;
+  }
+
+  // Launch Chrome
+  try {
+    await ensureChromeReady({ allowRelaunch: true });
+    console.log(`[Empir3 Bridge] Ready — Chrome connected via CDP on port ${CDP_PORT}`);
+    startTargetPolling();
+    // Connect browser-level WS for real-time target discovery (sees ALL tabs)
+    connectBrowserWs().catch(() => {});
+  } catch (e: any) {
+    console.error(`[Empir3 Bridge] Failed to launch Chrome: ${e.message}`);
+    console.log('[Empir3 Bridge] Waiting for Chrome to connect...');
+
+    // Poll for Chrome
+    const poll = async () => {
+      try {
+        await connectCDP();
+        console.log('[Empir3 Bridge] Chrome connected');
+        startTargetPolling();
+        connectBrowserWs().catch(() => {});
+      } catch {
+        setTimeout(poll, 3000);
+      }
+    };
+    poll();
+  }
+}
+
+main().catch((e) => {
+  console.error('[Empir3 Bridge] Fatal:', e);
+  process.exit(1);
+});
