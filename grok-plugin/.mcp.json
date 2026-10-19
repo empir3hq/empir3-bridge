@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "empir3-bridge": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "-p", "@empir3hq/empir3-bridge@0.4.8", "empir3-bridge-mcp"]
+    }
+  }
+}

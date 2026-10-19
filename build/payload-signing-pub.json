@@ -1,0 +1,7 @@
+{
+  "algorithm": "ed25519",
+  "publicKeyHex": "a0813b51654fcb6026c0cfc9d0f367c8535b96c94b52c9fff15d2fe59f7cd68a",
+  "publicKeyB64": "oIE7UWVPy2AmwM/J0PNnyFNblslLUsn/8V0v5Z981oo=",
+  "spkiB64": "MCowBQYDK2VwAyEAoIE7UWVPy2AmwM/J0PNnyFNblslLUsn/8V0v5Z981oo=",
+  "generatedAt": "2026-05-02T17:00:36.895Z"
+}

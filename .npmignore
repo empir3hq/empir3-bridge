@@ -1,0 +1,14 @@
+build/dist/
+build/check/
+build/payload-staging/
+build/pyinstaller-work/
+build/pyinstaller-spec/
+build/bundle-bootstrap.js
+build/sea-config.json
+build/sea-prep.blob
+build/*.pem
+*.spec
+feedback/
+recordings/
+.empir3-bridge/
+chrome-profile/
