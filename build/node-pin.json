@@ -1,0 +1,9 @@
+{
+  "_comment": "Pinned official Node runtime for the Go bootstrapper. node-pty is a native dependency, so nodeAbi (NODE_MODULE_VERSION) MUST match the payload's prebuilds. Update url+sha256+abi together when bumping. sha256 is the official nodejs.org SHASUMS256.txt entry for the win-x64 zip; abi is `node -p process.versions.modules` for that version. Values are embedded as STRINGS in the signed manifest.",
+  "version": "24.22.2",
+  "url": "https://nodejs.org/dist/v24.22.2/node-v24.22.2-win-x64.zip",
+  "sha256": "ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2",
+  "abi": "137",
+  "platform": "win32",
+  "arch": "x64"
+}

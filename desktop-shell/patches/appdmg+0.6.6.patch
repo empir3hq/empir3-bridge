@@ -1,0 +1,15 @@
+diff --git a/node_modules/appdmg/lib/appdmg.js b/node_modules/appdmg/lib/appdmg.js
+--- a/node_modules/appdmg/lib/appdmg.js
++++ b/node_modules/appdmg/lib/appdmg.js
+@@ -6,7 +6,10 @@ const path = require('path')
+ 
+ const async = require('async')
+ const DSStore = require('ds-store')
+-const sizeOf = require('image-size')
++// image-size 2.0.4 bounds malformed ICNS/JXL/HEIF parsing. Preserve appdmg's
++// callback API with its supported asynchronous file reader.
++const { imageSizeFromFile } = require('image-size/fromFile')
++const sizeOf = (file, callback) => imageSizeFromFile(file).then(value => callback(null, value), callback)
+ const validator = require('is-my-json-valid')
+ const parseColor = require('parse-color')
+ 
